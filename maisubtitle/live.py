@@ -785,7 +785,7 @@ class LivePipeline:
                     mt = mk()
                     break
                 except Exception as e:
-                    self.on_state(f"翻译引擎候选不可用({str(e)[:70]})")
+                    self.on_state(f"翻译引擎候选不可用({str(e)[:120]})")
             if mt is None:
                 # NLLB 已移除：没有兜底模型了 —— 宁可只出原文，也不假装翻译
                 mt = NullMT()

@@ -223,6 +223,13 @@ class QwenCT2:
         import ctranslate2
         t0 = time.perf_counter()
         ct2_dir = MODELS_DIR / model_dir
+        if not ct2_dir.is_dir():
+            # 不先查目录的话，CT2/transformers 会把绝对路径当仓库名去校验，报
+            # "Repo id must use alphanumeric chars, '-', '_' or '.'"（2026-09-18 实锤：
+            # 新装环境没下这个可选模型，用户看到的却是这句天书）
+            raise FileNotFoundError(
+                f"缺模型目录 {ct2_dir}（下载+转换：scripts/download_models.py --only "
+                "qwen_1_5b_hf，再 scripts/model_manager.py convert qwen_1_5b）")
         # 优先用 CT2 目录里自带的 tokenizer（含 tokenizer_config.json 的对话模板）；
         # 早期只拷了 tokenizer.json 的转换产物则回落到 tok_dir（默认同 CT2 目录）。
         # 用轻量 tokenizer（tokenizers+jinja2）替代 transformers：省约 6s 启动导入，
@@ -308,11 +315,23 @@ class HyMT2:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
-        path = str(MODELS_DIR / model_dir)
+        path = MODELS_DIR / model_dir
+        if not path.is_dir():
+            # 目录不存在时 transformers 会把这个**绝对路径**当成 HF 仓库名去校验，
+            # 报 "Repo id must use alphanumeric chars, '-', '_' or '.'" —— 完全看不懂。
+            raise FileNotFoundError(
+                f"缺权重目录 {path}（下载：scripts/download_models.py --only hymt2）")
+        if device == "cuda" and not torch.cuda.is_available():
+            # 装到 CPU 版 torch 时（新版 PyPI 的 Windows 轮子就是 CPU 版）不硬闯 cuda，
+            # 否则整个引擎直接不可用；降到 CPU 出译文，慢很多但比"只出原文"强。
+            device, dtype = "cpu", "float32"
+            print("[warn] torch 不带 CUDA → Hy-MT2 降级到 CPU 跑（每句会慢好几倍）；"
+                  "想要快就装 CUDA 版 torch，或把翻译引擎换成 qwen（CT2）")
+        self.device = device
         t0 = time.perf_counter()
-        self.tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        self.tok = AutoTokenizer.from_pretrained(str(path), trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
-            path, dtype=getattr(torch, dtype), device_map=device,
+            str(path), dtype=getattr(torch, dtype), device_map=device,
             trust_remote_code=True)
         self.model.eval()
         self.load_s = time.perf_counter() - t0
@@ -390,12 +409,18 @@ def translator_candidates(engine: str = "qwen") -> list:
 def make_translator(engine: str = "qwen", **kw):
     """按 engine 取一个翻译器（离线管线/基准脚本用；live.py 有带日志的版本）。
 
-    全部不可用时抛最后一个异常，由调用方决定退 NullMT（只出原文）。
+    全部不可用时抛异常，由调用方决定退 NullMT（只出原文）。
+    ⚠ 抛出的是**每个候选各自的失败原因**，不是一个：以前只留最后一个异常，结果真因被
+    后面的兜底候选盖掉 —— 实锤（2026-09-18）：hymt2 缺 accelerate（一句话就能修），
+    用户看到的却是 QwenCT2 那句 "Repo id must use alphanumeric chars…"。
     """
-    last = None
-    for mk in translator_candidates(engine):
+    errs = []
+    for i, mk in enumerate(translator_candidates(engine), 1):
         try:
             return mk(**kw)
-        except Exception as e:      # 记下最后一个异常继续尝试
-            last = e
-    raise last
+        except Exception as e:
+            label = getattr(mk, "__name__", "")
+            if not label or label == "<lambda>":
+                label = f"候选{i}"
+            errs.append(f"{label}: {e}")
+    raise RuntimeError("；".join(errs) or "没有可用的翻译引擎")

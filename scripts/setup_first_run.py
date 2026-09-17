@@ -70,6 +70,7 @@ CORE_IMPORTS = [
     "onnxruntime", "kaldi_native_fbank", "pyaudiowpatch", "keyboard", "psutil",
     "requests", "zhconv", "rapidfuzz", "jinja2", "tokenizers",
     "torch", "transformers",          # 默认翻译引擎 hymt2（PyTorch）需要
+    "accelerate",                     # hymt2 用 device_map 加载 → transformers 硬要求它
     "fireredvad", "onnx", "onnxscript",   # 导出 FireRedVAD ONNX 需要
 ]
 # 第二步单独装的（--no-deps）：faster-whisper 是识别引擎（缺了没得用），

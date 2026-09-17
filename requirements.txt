@@ -42,6 +42,8 @@ protobuf==7.36.1
 # --- 翻译（默认引擎 hymt2 = 腾讯混元 Hy-MT2-1.8B，走 PyTorch）---
 # torch 的轮子体积较大（约 2.5GB），安装器会自动装；只想用 CT2 引擎可以不装
 torch
+accelerate                  # hymt2 用 device_map 加载 → transformers 硬要求它
+                            #（开发机上从没暴露：外部 torch venv 里恰好带了 accelerate）
 transformers==5.17.0        # Hy-MT2 需要（transformers>=5.6 + trust_remote_code）
 fireredvad==0.0.2           # 导出 FireRedVAD ONNX 用（默认 VAD 首次安装时导一次）
 onnx>=1.18                  # 同上：torch>=2.6 的 torch.onnx.export 需要它

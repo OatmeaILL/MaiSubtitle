@@ -132,7 +132,9 @@ def main(argv=None):
                 mt = make_translator(eng)
             except Exception as e:
                 # NLLB 已移除：没有兜底模型 → 只出原文（NullMT），并把原因报给主进程
-                say(f"warn: 翻译引擎全部不可用({str(e)[:70]}) → 只出原文")
+                # [:200] 而不是 [:70]：make_translator 现在会把**每个候选**的原因都带上，
+                # 截太短会把第一个（通常才是真因）剪掉。
+                say(f"warn: 翻译引擎全部不可用({str(e)[:200]}) → 只出原文")
                 mt = NullMT()
             st["mt"] = mt
             say(f"{eng} 就绪 {type(mt).__name__} "
