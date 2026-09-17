@@ -4,7 +4,7 @@ import re
 import time
 from pathlib import Path
 
-from .config import MODELS_DIR
+from .config import MODELS_DIR, mount_external_torch
 
 
 def to_simplified(text: str) -> str:
@@ -239,6 +239,7 @@ class QwenCT2:
         self.tok = _load_chat_tokenizer(tok_src)
         self.gen = ctranslate2.Generator(str(ct2_dir),
                                          device=device, compute_type=compute_type)
+        self.device = device          # 日志里要报"跑在 GPU 还是 CPU"（gpu_child/live）
         self.eos = self.tok.eos_token_id
         # Qwen3 系列默认开思考模式（先输出 <think>…</think>），字幕场景必须关掉；
         # 对没有该变量的模板（如 Qwen2.5）传了也无害。
@@ -312,6 +313,12 @@ class HyMT2:
 
     def __init__(self, device: str = "cuda", model_dir: str = "Hy-MT2-1.8B",
                  dtype: str = "bfloat16"):
+        # 先看用户有没有指定外部 CUDA torch（config.json 的 torch_external_dir）。
+        # 必须在 `import torch` **之前**：本环境装的是 CPU 版 torch，只有替换 sys.modules
+        # 才换得掉（追加 sys.path 不生效，见 config.mount_external_torch 的注释）。
+        _ext_note = mount_external_torch()
+        if _ext_note:
+            print("[torch] " + _ext_note, flush=True)
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch

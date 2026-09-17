@@ -18,35 +18,147 @@ for _d in (MODELS_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
+def config_json_field(key: str, default=""):
+    """直接读 config.json 的某个字段。
+
+    用在"AppConfig 还没定义"或"必须在 import torch 之前就读到"的场景（本模块导入时）。
+    读不到/文件坏了就返回 default —— **绝不因为配置问题让程序起不来**。
+    """
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data.get(key, default)
+    except Exception:
+        return default
+
+
+def external_torch_site():
+    """用户指定的外部 torch 目录 → 真正的 site-packages；没配/找不到返回 None。
+
+    config.json 的 `torch_external_dir` 可以填 site-packages 目录，也可以填 venv 根目录
+    （自动补 `Lib/site-packages`）。
+    """
+    raw = str(config_json_field("torch_external_dir") or "").strip()
+    if not raw:
+        return None
+    p = Path(os.path.expandvars(os.path.expanduser(raw)))
+    for c in (p, p / "Lib" / "site-packages"):
+        if (c / "torch" / "__init__.py").is_file():
+            return c
+    return None
+
+
+def _shadow_torch_metadata(site: Path) -> None:
+    """让 importlib.metadata 报出**外部那份** torch 的版本（只改"版本号怎么报"）。
+
+    为什么必须做：transformers 判定 torch 能力用的是 **importlib.metadata 的版本号**
+    （`is_torch_flex_attn_available()` = `get_torch_version() >= 2.5`；
+    `_TORCH_FLEX_USE_AUX` = `is_torch_greater_or_equal("2.9.0")`），**不是** `torch.__version__`。
+    本 venv 里装着 CPU 版 torch（例如 2.14）时：
+      · 元数据报 2.14 → transformers 以为在用"新版 torch"→ 去 import 只有 2.9+ 才有的 AuxRequest；
+      · 而真正加载的是外部那份 2.6 → `ImportError: cannot import name 'AuxRequest'`
+    （2026-09-18 实测：开发机能跑、本机挂了，差别就在"本地有没有另一份 torch 的元数据"。）
+
+    做法：造一个**只含 dist-info** 的影子目录并插到 sys.path 最前 ——
+    里面没有任何可导入的包，不会覆盖真正的模块，只影响版本号。
+    """
+    ver = ""
+    try:
+        for meta in site.glob("torch-*.dist-info/METADATA"):
+            for line in meta.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("Version:"):
+                    ver = line.split(":", 1)[1].strip()
+                    break
+            if ver:
+                break
+    except Exception:
+        return
+    if not ver:
+        return
+    try:
+        d = PROJECT_ROOT / ".external_torch_meta" / ("torch-" + ver + ".dist-info")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: torch\nVersion: " + ver + "\n",
+            encoding="utf-8")
+        root = str(d.parent)
+        if root in sys.path:
+            sys.path.remove(root)
+        sys.path.insert(0, root)      # 最前：元数据以这份为准
+    except Exception:
+        pass
+
+
+def mount_external_torch() -> str:
+    """把用户指定的外部 CUDA torch 装成 sys.modules["torch"]，**不动 sys.path**。
+
+    为什么这么绕：本项目 venv 里已经装了 CPU 版 torch（requirements 里的 torch）——
+      · 只把外部目录**追加**到 sys.path → 本地那份 CPU 版仍然先被 import（等于没换）；
+      · 把外部目录**插到最前** → 它的 numpy/transformers 也会一起顶上来，污染整个环境。
+    所以只替换 `torch` 这一个模块。**必须在任何 import torch 之前调用。**
+    （调用点：translate.HyMT2 构造、scripts/export_fireredvad_onnx.py。）
+
+    返回一句人话（没配置 → 空串）；挂载失败会退回本地 torch，绝不抛异常。
+    """
+    if "torch" in sys.modules:
+        return ""            # 已经导入过了：调用点保证在 import 之前，这里只是保险
+    site = external_torch_site()
+    if site is None:
+        return ""
+    import importlib.util
+    pkg = site / "torch"
+    _shadow_torch_metadata(site)      # 版本号也要对齐，否则 transformers 会选错代码路径
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "torch", pkg / "__init__.py", submodule_search_locations=[str(pkg)])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["torch"] = mod        # 先占位：torch 内部再 import torch 要能拿到自己
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        sys.modules.pop("torch", None)    # 退回本地 torch
+        return f"外部 torch 挂载失败，已退回本地：{type(e).__name__}: {str(e)[:80]}"
+    try:
+        ok = bool(mod.cuda.is_available())
+        tag = f"CUDA {mod.version.cuda}" if ok else "CUDA 不可用"
+    except Exception:
+        tag = "CUDA 状态未知"
+    return f"外部 torch {mod.__version__}（{tag}）← {site}"
+
+
 def ensure_external_torch() -> list:
     """冻结版（打包 exe）挂载源码环境里的 torch/transformers，让打包版也能用 Qwen。
 
     打包版按设计不含 torch（396MB vs 3GB），但 exe 部署在项目根目录时，
     旁边就有 .venv，可以借用：
-      1. .pth 指向的外部 site-packages（CUDA torch，如 E:\\applications\\0manbo）
-      2. 项目 .venv 的 site-packages（transformers / tokenizers / safetensors）
-      3. 基础 Python 的 Lib + DLLs（打包时 torch 被排除，torch 依赖的 timeit 等
+      1. 用户配置的 torch_external_dir（最省事）
+      2. .pth 指向的外部 site-packages（CUDA torch，如 E:\\applications\\0manbo）
+      3. 项目 .venv 的 site-packages（transformers / tokenizers / safetensors）
+      4. 基础 Python 的 Lib + DLLs（打包时 torch 被排除，torch 依赖的 timeit 等
          标准库没进 base_library.zip，需要从原解释器补齐）
-    路径不存在就静默跳过。源码环境（非 frozen）无需处理。
+    路径不存在就静默跳过。
+
+    ⚠ 源码环境（非 frozen）**不在这里挂用户配置的目录**：源码 venv 里已经装了 CPU 版
+    torch，"追加路径"不生效。那条走 mount_external_torch()（只替换 torch 模块）。
     """
-    if not getattr(sys, "frozen", False):
-        return []
-    venv = PROJECT_ROOT / ".venv"
-    site = venv / "Lib" / "site-packages"
     cands = []
-    pth = site / "zz-maisub-external-torch.pth"
-    if pth.exists():
-        lines = pth.read_text(encoding="utf-8").strip().splitlines()
-        if lines:
-            cands.append(Path(lines[0].strip()))
-    cands.append(site)
-    cfg = venv / "pyvenv.cfg"
-    if cfg.exists():
-        for line in cfg.read_text(encoding="utf-8").splitlines():
-            if line.strip().lower().startswith("home"):
-                home = Path(line.split("=", 1)[1].strip())
-                cands.extend([home / "Lib", home / "DLLs"])
-                break
+    if getattr(sys, "frozen", False):
+        ext = external_torch_site()
+        if ext is not None:
+            cands.append(ext)
+        venv = PROJECT_ROOT / ".venv"
+        site = venv / "Lib" / "site-packages"
+        pth = site / "zz-maisub-external-torch.pth"
+        if pth.exists():
+            lines = pth.read_text(encoding="utf-8").strip().splitlines()
+            if lines:
+                cands.append(Path(lines[0].strip()))
+        cands.append(site)
+        cfg = venv / "pyvenv.cfg"
+        if cfg.exists():
+            for line in cfg.read_text(encoding="utf-8").splitlines():
+                if line.strip().lower().startswith("home"):
+                    home = Path(line.split("=", 1)[1].strip())
+                    cands.extend([home / "Lib", home / "DLLs"])
+                    break
     added = []
     for c in cands:
         if c.is_dir() and str(c) not in sys.path:
@@ -140,6 +252,10 @@ class AppConfig:
     # 翻译
     engine: str = "hymt2"               # hymt2（推荐，权重自备）/ qwen / qwen3
     context_sentences: int = 7
+    # 外部 CUDA torch 目录（进阶）：填了就优先用它的 torch，省下 2.5GB 下载。
+    # 可填 site-packages 或 venv 根目录；留空 = 用本环境的 torch。
+    # 只在 HyMT2（走 PyTorch）上用得到；改了要重启（挂载发生在 import torch 之前）。
+    torch_external_dir: str = ""
     # 显示
     bilingual: bool = True              # 由 display_mode 推导（导出用）：仅 bilingual 模式为真
     display_mode: str = "bilingual"     # bilingual 双语 / target 仅译文 / source 仅原文

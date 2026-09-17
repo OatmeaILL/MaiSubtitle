@@ -44,6 +44,7 @@ RESTART_FIELDS = {
     "seam_punct": "接缝标点判定", "punct_final": "定稿补标点", "pre_roll": "前卷",
     "stream_mode": "流式模式", "beam_size": "识别束宽",
     "context_sentences": "翻译上下文句数", "gpu_subprocess": "GPU 子进程开关",
+    "torch_external_dir": "外部 torch 目录",
     "asr_http_url": "HTTP 地址", "asr_http_model": "服务端模型名",
     "asr_ws_url": "火山流式地址", "asr_ws_model_name": "火山模型名称",
     "asr_ws_api_key": "火山 API Key",
@@ -517,12 +518,31 @@ class SettingsDialog(QDialog):
             "时只重启子进程并重载模型，悬浮窗与采集不受影响。\n"
             "关掉后回到老行为：卡死要靠守护进程杀掉整个程序。重启生效。")
         form.addRow("", self.chk_gpuproc)
+
+        # 外部 CUDA torch（进阶）：机器上已经有别的带 CUDA 的 torch 环境时，指一下就不必
+        # 再下 2.5GB。只影响走 PyTorch 的 hymt2 引擎。**重启生效**（挂载在 import torch 之前）。
+        self.ed_torch_dir = QLineEdit(str(getattr(cfg, "torch_external_dir", "") or ""))
+        self.ed_torch_dir.setPlaceholderText("留空 = 用本环境的 torch；可填 site-packages 或 venv 根目录")
+        _btn_torch = QPushButton("浏览…")
+        _btn_torch.clicked.connect(self._browse_torch_dir)
+        _row_torch = QHBoxLayout()
+        _row_torch.addWidget(self.ed_torch_dir)
+        _row_torch.addWidget(_btn_torch)
+        form.addRow("外部 torch 目录（重启生效）", _wrap(_row_torch))
         return page
 
     def _browse_glossary(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择术语库", "", "术语库 (*.csv *.json)")
         if path:
             self.ed_glossary.setText(path)
+
+    def _browse_torch_dir(self):
+        """选外部 torch 目录：**允许选 venv 根目录**（config.external_torch_site 会自动补
+        Lib/site-packages），所以这里只提示"选 site-packages 或 venv 根目录都行"。"""
+        path = QFileDialog.getExistingDirectory(
+            self, "选择带 CUDA 版 torch 的环境目录（site-packages 或 venv 根目录）")
+        if path:
+            self.ed_torch_dir.setText(path)
 
     # ---------------- 联动 ----------------
     def _sync_backend(self, *_a):
@@ -726,6 +746,8 @@ class SettingsDialog(QDialog):
         cfg.bilingual = (cfg.display_mode == "bilingual")
         cfg.click_through = self.chk_through.isChecked()
         cfg.glossary_path = _resolve("glossary_path", self.ed_glossary.text().strip())
+        # 外部 torch 目录：保持用户填的原样（绝对路径），交给 config.mount_external_torch 解析
+        cfg.torch_external_dir = self.ed_torch_dir.text().strip()
         cfg.save()
         # 立即生效项
         overlay.set_font_sizes(cfg.font_size_src, cfg.font_size_dst)

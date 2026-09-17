@@ -147,10 +147,33 @@ def torch_ok(py: Path | None = None) -> bool:
 
 
 def torch_has_cuda(py: Path | None = None) -> bool:
-    """torch 能不能用 CUDA。默认翻译引擎 hymt2 走 PyTorch —— CPU 上慢到没法用，
+    """torch 能不能用 CUDA。默认翻译引擎 hymt2 走 PyTorch —— CPU 上慢好几倍，
     所以装完必须体检一下（新版 PyPI 的 Windows 轮子是 CPU 版，很容易装上 2.14.0+cpu）。"""
     return quiet_ok([py or VENV_PY, "-c",
                      "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"])
+
+
+# ---- CUDA 版 torch：能连官方源就装 ----
+# 实测（2026-09-18）：国内 8 个镜像（阿里云/清华/中科大/上交/南大/北外/CERNET/腾讯）
+# **都没有 Windows 的 CUDA torch 轮子**，官方索引才是唯一来源；而官方源国内直连可用
+# （8.9 MB/s，2.4GB 约 5 分钟）。所以这里不"选源"，只做"探活 + 失败不阻塞"。
+TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu124"
+TORCH_CUDA_SPEC = "torch==2.6.0+cu124"      # 与开发机同款，CUDA 12.4（驱动 ≥525 即可）
+
+
+def has_nvidia_gpu() -> bool:
+    return shutil.which("nvidia-smi") is not None
+
+
+def cuda_index_reachable(seconds: int = 8) -> bool:
+    """官方 CUDA 索引通不通。不通就跳过 CUDA torch —— 绝不能因此让安装失败。"""
+    try:
+        req = urllib.request.Request(TORCH_CUDA_INDEX + "/torch/",
+                                     headers={"User-Agent": "MaiSubtitle-setup"})
+        with urllib.request.urlopen(req, timeout=seconds) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 # ---------------- PyPI 源：先测速，再选最快的 ----------------
@@ -259,26 +282,36 @@ def installer_kind(py: Path | None = None) -> str:
     return ""
 
 
-def _run_pip(py: Path, args: list, no_deps: bool) -> int:
-    _, index_url, host = mirror()
-    cmd = [py, "-m", "pip", "install", *args,
-           "-i", index_url, "--trusted-host", host,
-           "--disable-pip-version-check"]
+def _run_pip(py: Path, args: list, no_deps: bool, index_url: str | None = None) -> int:
+    _, mirror_url, host = mirror()
+    idx = index_url or mirror_url
+    cmd = [py, "-m", "pip", "install", *args, "-i", idx]
+    if index_url:
+        # 指定了特殊索引（如 torch 的 CUDA 索引）：torch 本体只可能来自它，
+        # 但它缺的依赖可以走我们测速选出来的快源
+        cmd += ["--extra-index-url", mirror_url]
+    else:
+        cmd += ["--trusted-host", host]
+    cmd.append("--disable-pip-version-check")
     if no_deps:
         cmd.append("--no-deps")
     return run(cmd)
 
 
-def pip_install(args: list, py: Path | None = None, no_deps: bool = False) -> int:
+def pip_install(args: list, py: Path | None = None, no_deps: bool = False,
+                index_url: str | None = None) -> int:
     """装包：venv 自带 pip → uv pip → ensurepip 补 pip 再装。都失败返回非 0。"""
     py = py or VENV_PY
-    _, index_url, _ = mirror()
+    _, mirror_url, _ = mirror()
     kind = installer_kind(py)
     if kind == "pip":
-        return _run_pip(py, args, no_deps)
+        return _run_pip(py, args, no_deps, index_url)
     if kind == "uv":
         say("      （这个 .venv 里没有 pip —— uv 建的 venv 默认不带；改用 uv pip 安装）")
-        cmd = ["uv", "pip", "install", "--python", py, *args, "--index-url", index_url]
+        cmd = ["uv", "pip", "install", "--python", py, *args,
+               "--index-url", index_url or mirror_url]
+        if index_url:
+            cmd += ["--extra-index-url", mirror_url]
         if no_deps:
             cmd.append("--no-deps")
         if run(cmd) == 0:
@@ -345,17 +378,32 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
         else:
             say("\n[1/5] 依赖：[OK] 齐全")
 
-    # ---- 1b. 显卡体检：hymt2 翻译走 PyTorch，装到 CPU 版 torch 会慢到没法用 ----
+    # ---- 1b. 显卡体检 +（能连官方源就）试装 CUDA 版 torch ----
     if not missing_imports(["torch"]):
         if torch_has_cuda():
             say("      torch 带 CUDA ✓（hymt2 翻译走 GPU）")
         else:
-            say("      [注意] 装到的 torch 不带 CUDA（新版 PyPI 的 Windows 轮子是 CPU 版）"
-                "—— 默认翻译引擎 hymt2 会在 CPU 上跑，每句要好几个秒")
-            say("             ① 换引擎（推荐）：设置 → 翻译引擎 → qwen（CT2，约 0.22s/句，"
-                "不依赖 torch）")
-            say("             ② 或装 CUDA 版 torch：需要代理能通 download.pytorch.org"
-                "（见 README 常见问题）")
+            say("      [注意] 装到的 torch 不带 CUDA —— 新版 PyPI 的 Windows 轮子都是 CPU 版"
+                "（国内镜像也没有 CUDA 版），hymt2 会跑 CPU")
+            if not has_nvidia_gpu():
+                say("             本机没检测到 NVIDIA 显卡（nvidia-smi），跑 CPU 是正常的；"
+                    "想更快可换引擎：设置 → 翻译引擎 → qwen（CT2，约 0.22s/句）")
+            elif not fix:
+                say(f"             真装时会试装 CUDA 版：{TORCH_CUDA_SPEC}（约 2.4GB）")
+            elif not cuda_index_reachable():
+                say("             官方源（download.pytorch.org）连不上 → 跳过 CUDA torch，"
+                    "hymt2 照样能用（跑 CPU，实测每句 1~2 秒）")
+                say("             机器上已有别的带 CUDA 的 torch？"
+                    "设置 → 外部 torch 目录 指一下即可（不用下载）")
+            else:
+                say(f"             检测到 N 卡 → 试装 CUDA 版 torch"
+                    f"（{TORCH_CUDA_SPEC}，约 2.4GB，实测约 5 分钟）…")
+                pip_install([TORCH_CUDA_SPEC], index_url=TORCH_CUDA_INDEX)
+                if torch_has_cuda():
+                    say("      [OK] CUDA 版 torch 装好了（hymt2 翻译走 GPU）")
+                else:
+                    say("      [注意] CUDA 版没装成 → 保持 CPU 版；"
+                        "可稍后重跑本脚本，或在设置里指定外部 torch 目录")
 
     # ---- 2. 两个必须 --no-deps 单独装的包（见文件头 ②）----
     if skip_deps:

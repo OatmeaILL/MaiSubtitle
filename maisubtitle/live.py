@@ -792,7 +792,8 @@ class LivePipeline:
                 self.on_state("warn: 翻译引擎全部不可用 → 只出原文")
                 self.notify_safe("翻译模型不可用：本次只显示原文，不翻译")
             self._mt = mt
-            self.on_state(f"{cfg.engine} 就绪 {type(mt).__name__} {mt.load_s:.1f}s")
+            self.on_state(f"{cfg.engine} 就绪 {type(mt).__name__} {mt.load_s:.1f}s"
+                          f" | 设备 {getattr(mt, 'device', '?')}")
         glossary = Glossary(gp) if (gp := cfg.glossary_file) else None
 
         # ---- 模型预热：先跑一次极短推理，把 CUDA kernel 首次编译 / 显存首次分配的

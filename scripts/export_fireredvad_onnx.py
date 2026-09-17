@@ -16,11 +16,18 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-import torch
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# 挂外部 CUDA torch（config.json 的 torch_external_dir）——必须在 import torch 之前
+from maisubtitle.config import mount_external_torch  # noqa: E402
+
+_EXT = mount_external_torch()
+if _EXT:
+    print("[torch] " + _EXT, flush=True)
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 
 def main():

@@ -137,8 +137,17 @@ def main(argv=None):
                 say(f"warn: 翻译引擎全部不可用({str(e)[:200]}) → 只出原文")
                 mt = NullMT()
             st["mt"] = mt
+            # 把"跑在 GPU 还是 CPU"写清楚：以前只有一条 warn 藏在中间，
+            # 用户（和排查的人）根本看不出翻译到底用没用显卡
+            _dev = getattr(mt, "device", None)
+            if not _dev:
+                try:
+                    import torch as _t
+                    _dev = "cuda" if _t.cuda.is_available() else "cpu"
+                except Exception:
+                    _dev = "?"
             say(f"{eng} 就绪 {type(mt).__name__} "
-                f"{float(getattr(mt, 'load_s', 0) or 0):.1f}s")
+                f"{float(getattr(mt, 'load_s', 0) or 0):.1f}s | 设备 {_dev}")
         return st["mt"]
 
     for line in sys.stdin:
