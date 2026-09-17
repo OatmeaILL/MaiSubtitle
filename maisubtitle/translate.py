@@ -347,8 +347,13 @@ class HyMT2:
         with self.torch.inference_mode():
             out = self.model.generate(**inputs, max_new_tokens=max_tokens,
                                       do_sample=False, repetition_penalty=1.05)
+        # clean_up_tokenization_spaces=False：显式关掉"标点前空格清理"。Hy-MT2 是 BPE
+        # tokenizer，transformers 对 BPE **本来就会忽略**这个设置并打一条警告
+        #（"Ignoring clean_up_tokenization_spaces=True for BPE tokenizer…"）——
+        # 显式传 False 行为完全一样，但启动时不再刷那条吓人的警告。
         return self.tok.decode(out[0][inputs["input_ids"].shape[1]:],
-                               skip_special_tokens=True).strip()
+                               skip_special_tokens=True,
+                               clean_up_tokenization_spaces=False).strip()
 
     def translate(self, text: str, src_lang: str,
                   context: list[str] | None = None) -> tuple[str, dict]:
