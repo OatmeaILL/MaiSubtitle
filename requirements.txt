@@ -44,6 +44,9 @@ protobuf==7.36.1
 torch
 transformers==5.17.0        # Hy-MT2 需要（transformers>=5.6 + trust_remote_code）
 fireredvad==0.0.2           # 导出 FireRedVAD ONNX 用（默认 VAD 首次安装时导一次）
+onnx>=1.18                  # 同上：torch>=2.6 的 torch.onnx.export 需要它
+onnxscript                  # 同上：新版导出器（dynamo）的依赖，缺了直接
+                            #       ModuleNotFoundError: No module named 'onnxscript'
 
 # --- 可选：不装也能跑，只影响对应功能 ---
 librosa==0.10.2             # 仅 Qwen3-ASR（ONNX）识别后端需要

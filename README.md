@@ -82,7 +82,7 @@ uv venv --python 3.12 --seed .venv   # --seed 顺带装 pip（uv 建的 venv 默
 |---|---|---|
 | qwen | Qwen2.5-1.5B-CT2 | 最快，约 0.22 秒每句 |
 | qwen3 | Qwen3-1.7B-CT2 | 约 0.37 秒每句 |
-| hymt2 | 混元 Hy-MT2-1.8B | 约 1.3 秒每句，默认引擎 |
+| hymt2 | 混元 Hy-MT2-1.8B | 约 1.3 秒每句，默认引擎；需要 CUDA 版 torch，没有就换成 qwen |
 
 引擎都不可用时只显示原文。
 
@@ -116,6 +116,8 @@ Esc 没有绑定功能，退出用托盘菜单。
 | 缺模型 | `安装_首次使用.bat --check` 会列出缺什么以及对应命令 |
 | 下载模型失败 | 报错会写 `[fail] 项名（缺 哪个文件）`。脚本按 HF 镜像 → 官方源 → ModelScope 镜像依次试；都不通就按提示把权重手动放进 `models/` 里对应目录 |
 | 卡住或闪退 | 已知问题，守护进程会在心跳超时 25 秒后自动重启 |
+| 译文出得很慢 | 多半是装到的 torch 不带 CUDA（新版 PyPI 的 Windows 轮子就是 CPU 版）→ 设置里把翻译引擎换成 `qwen`（CT2，约 0.22 秒每句，不用 torch）；想用 hymt2 就装 CUDA 版 torch：`pip install torch --index-url https://download.pytorch.org/whl/cu124` |
+| 分句比预期碎 | 缺 FireRedVAD ONNX 时会自动回落 Silero（切得更碎）：`安装_首次使用.bat --skip-models` 重跑一次把导出补上（要 onnx + onnxscript，安装器会自动装） |
 
 ## 其它
 

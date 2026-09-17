@@ -63,11 +63,14 @@ FORCED_MIRROR = os.environ.get("MAISUB_PYPI_MIRROR", "")   # 非空 = 跳过测�
 _MIRROR = None                     # 测速结果缓存（名称, index_url, host）
 
 # 启动必需的关键 import（对应 requirements.txt 里"能一把装上"的那些）
+# fireredvad / onnx / onnxscript 是"导出 FireRedVAD ONNX"那一步要的，一起验：
+# 少了它们的表现是**导出崩**，不在启动路径上，最容易被漏掉（2026-09-18 实锤）。
 CORE_IMPORTS = [
     "PyQt6", "numpy", "av", "soundfile", "soxr", "ctranslate2",
     "onnxruntime", "kaldi_native_fbank", "pyaudiowpatch", "keyboard", "psutil",
     "requests", "zhconv", "rapidfuzz", "jinja2", "tokenizers",
     "torch", "transformers",          # 默认翻译引擎 hymt2（PyTorch）需要
+    "fireredvad", "onnx", "onnxscript",   # 导出 FireRedVAD ONNX 需要
 ]
 # 第二步单独装的（--no-deps）：faster-whisper 是识别引擎（缺了没得用），
 # funasr-onnx + jieba 只影响"中文补标点走 CPU"与 FSMN VAD（缺了自动回落，只提示）
@@ -140,6 +143,13 @@ def missing_imports(names: list, py: Path | None = None) -> list:
 def torch_ok(py: Path | None = None) -> bool:
     return subprocess.run([str(py or VENV_PY), "-c", "import torch"],
                           capture_output=True, cwd=str(ROOT)).returncode == 0
+
+
+def torch_has_cuda(py: Path | None = None) -> bool:
+    """torch 能不能用 CUDA。默认翻译引擎 hymt2 走 PyTorch —— CPU 上慢到没法用，
+    所以装完必须体检一下（新版 PyPI 的 Windows 轮子是 CPU 版，很容易装上 2.14.0+cpu）。"""
+    return quiet_ok([py or VENV_PY, "-c",
+                     "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"])
 
 
 # ---------------- PyPI 源：先测速，再选最快的 ----------------
@@ -334,6 +344,18 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
         else:
             say("\n[1/5] 依赖：[OK] 齐全")
 
+    # ---- 1b. 显卡体检：hymt2 翻译走 PyTorch，装到 CPU 版 torch 会慢到没法用 ----
+    if not missing_imports(["torch"]):
+        if torch_has_cuda():
+            say("      torch 带 CUDA ✓（hymt2 翻译走 GPU）")
+        else:
+            say("      [注意] 装到的 torch 不带 CUDA（新版 PyPI 的 Windows 轮子是 CPU 版）"
+                "—— 默认翻译引擎 hymt2 会在 CPU 上跑，每句要好几个秒")
+            say("             ① 换引擎（推荐）：设置 → 翻译引擎 → qwen（CT2，约 0.22s/句，"
+                "不依赖 torch）")
+            say("             ② 或装 CUDA 版 torch：需要代理能通 download.pytorch.org"
+                "（见 README 常见问题）")
+
     # ---- 2. 两个必须 --no-deps 单独装的包（见文件头 ②）----
     if skip_deps:
         say("\n[2/5] faster-whisper / funasr-onnx：跳过（--skip-deps）")
@@ -385,10 +407,15 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
     else:
         say("\n[4/5] FireRedVAD 导出：把权重导成 ONNX（主程序用它做分句，不需要 torch）")
         if fix:
-            if run([VENV_PY, str(ROOT / "scripts" / "model_manager.py"),
-                    "export", "firered"]) != 0:
-                say("      [错误] 导出失败：见上面的报错")
-                return False
+            run([VENV_PY, str(ROOT / "scripts" / "model_manager.py"), "export", "firered"])
+            if not FIRERED_ONNX.exists():
+                # **验产物，别信退出码**：导出脚本崩了也可能一路 0（2026-09-18 实锤）
+                say("      [错误] 没生成 stream_vad.onnx（原因见上面的报错）："
+                    "最常见是缺 onnx / onnxscript")
+                say("      [注意] 缺它主程序会自动回落到 Silero：能用，但句子切得更碎；"
+                    "补好依赖后重跑本脚本即可")
+            else:
+                say("      [OK] 已导出 models/fireredvad-onnx/stream_vad.onnx")
         else:
             ok = False
 

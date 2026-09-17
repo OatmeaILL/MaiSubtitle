@@ -123,17 +123,21 @@ def cmd_download(tier: str):
             and dir_size_mb(model_path("qwen_1_5b_ct2")) < 100):
         print("\n检测到 HF 权重但缺 CT2 版 → 自动转换 Qwen2.5-1.5B-CT2 …")
         import subprocess
-        subprocess.run([sys.executable,
-                        str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), "1.5b"],
-                       check=False)
+        r = subprocess.run([sys.executable,
+                            str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), "1.5b"])
+        if r.returncode != 0:
+            print("[注意] 自动转换失败（见上）；可单独重跑："
+                  "scripts/model_manager.py convert qwen_1_5b")
     # FireRedVAD：权重下好了但 ONNX 还没导出 → 自动导出（否则 VAD 用不上 FireRed）
     if (dir_size_mb(MODELS_DIR / "fireredvad") > 1
             and dir_size_mb(model_path("firered")) <= 0.1):
         print("\n检测到 FireRedVAD 权重但缺 ONNX → 自动导出 …")
         import subprocess
-        subprocess.run([sys.executable,
-                        str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")],
-                       check=False)
+        r = subprocess.run([sys.executable,
+                            str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")])
+        if r.returncode != 0:
+            print("[注意] 自动导出失败（见上）；可单独重跑："
+                  "scripts/model_manager.py export firered")
     cmd_list()
 
 
@@ -143,13 +147,23 @@ def cmd_convert(name: str):
     if key is None:
         print(f"无可转换项: {name}（可用: qwen_1_5b / qwen3_1_7b_ct2）")
         sys.exit(2)
-    subprocess.run([sys.executable,
-                    str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), key], check=False)
+    r = subprocess.run([sys.executable,
+                        str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), key])
     cmd_list()
+    if r.returncode != 0:
+        print(f"\n[错误] 转换失败（退出码 {r.returncode}）：见上面的报错；"
+              "转 CT2 需要 torch + transformers")
+        sys.exit(1)
 
 
 def cmd_export(name: str):
-    """把下载来的原始权重导出成运行时可用的 ONNX（目前只有 FireRedVAD）。"""
+    """把下载来的原始权重导出成运行时可用的 ONNX（目前只有 FireRedVAD）。
+
+    ⚠ 必须把子进程的失败**传出去**：以前用 `check=False` 且不看返回码，导出脚本崩了本函数
+    照样 exit 0 → 调用方（安装器 / 用户脚本）以为已经导好了。实锤（2026-09-18 新机器）：
+    缺 onnxscript → 导出抛 ModuleNotFoundError，安装器的 [4/5] 却打不出任何 [错误]，
+    最后只靠"还缺 FireRedVAD ONNX"倒推出来。
+    """
     if name != "firered":
         print(f"无可导出项: {name}（可用: firered）")
         sys.exit(2)
@@ -158,9 +172,16 @@ def cmd_export(name: str):
     if dir_size_mb(src) < 1:
         print("缺权重：先运行 python scripts/download_models.py --only firered")
         sys.exit(2)
-    subprocess.run([sys.executable,
-                    str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")], check=False)
+    r = subprocess.run([sys.executable,
+                        str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")])
+    onnx_path = MODELS_DIR / "fireredvad-onnx" / "stream_vad.onnx"
     cmd_list()
+    if r.returncode != 0 or not onnx_path.exists():
+        # 除了退出码还验产物在不在 —— "退出码 0 但没产出"也算失败
+        print(f"\n[错误] FireRedVAD 导出失败（退出码 {r.returncode}，产物"
+              f"{'在' if onnx_path.exists() else '没生成'}）：见上面的报错。"
+              "常见原因：缺 onnx / onnxscript → pip install onnx onnxscript")
+        sys.exit(1)
 
 
 def cmd_delete(name: str):

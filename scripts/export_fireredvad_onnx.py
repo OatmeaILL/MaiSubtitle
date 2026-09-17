@@ -68,11 +68,20 @@ def main():
         dynamic[f"out_cache{i}"] = {2: "Tc"}
 
     with torch.no_grad():
-        torch.onnx.export(
-            model, (feat, zeros), str(onnx_path),
-            input_names=in_names, output_names=out_names,
-            dynamic_axes=dynamic, opset_version=13,
-            do_constant_folding=True)
+        try:
+            torch.onnx.export(
+                model, (feat, zeros), str(onnx_path),
+                input_names=in_names, output_names=out_names,
+                dynamic_axes=dynamic, opset_version=13,
+                do_constant_folding=True)
+        except ModuleNotFoundError as e:
+            # torch>=2.6 的 torch.onnx.export 走 dynamo 导出器，需要 onnx + onnxscript
+            # （老版本 torch 只用 onnx）。缺了别抛一大坨栈，直接给命令。
+            print(f"\n[错误] 导出需要 onnx 与 onnxscript，当前缺：{e.name}")
+            print(f'  装法："{sys.executable}" -m pip install onnx onnxscript')
+            print("  （重跑 安装_首次使用.bat 也会自动补上；缺这两样只影响本次导出，"
+                  "运行时不依赖它们）")
+            return 2
     print(f"已导出: {onnx_path} ({onnx_path.stat().st_size/1e6:.2f} MB)")
 
     # --- 3) CMVN 落盘（运行时不再需要 kaldiio） ---
