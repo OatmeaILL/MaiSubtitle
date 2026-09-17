@@ -1,9 +1,9 @@
 # MaiSubtitle 运行时依赖（Windows / Python 3.12）
-# 安装：.venv\Scripts\python.exe -m pip install -r requirements.txt
 #
-#  **不需要 torch**：本项目只用 CT2 / ONNX 推理。
-#   只有"把 HuggingFace 权重转成 CT2"（首次准备翻译模型，scripts/convert_qwen_ct2.py）
-#   那一步才要 transformers + torch —— 想省事就直接把现成的 CT2 目录放进 models/。
+# 怎么装：**双击 安装_首次使用.bat**（推荐）；手动装见 README「手动安装」。
+#   本文件是"能一把装上的那些"，命令：
+#       .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+#   ⚠ 但**只有这一条还不够**：下面末尾有两个包必须单独装，装法见文件末尾。
 
 # --- 界面 / 系统 ---
 PyQt6==6.11.0
@@ -20,7 +20,7 @@ soundfile==0.14.0
 soxr==1.1.0
 
 # --- 识别 ---
-faster-whisper==1.2.1
+# 注：faster-whisper 不在这里（它要 --no-deps 单独装，见文件末尾）
 ctranslate2==4.8.2
 tokenizers==0.23.2
 Jinja2==3.1.6               # 对话模板渲染（轻量 tokenizer）
@@ -40,12 +40,34 @@ requests==2.34.2
 protobuf==7.36.1
 
 # --- 翻译（默认引擎 hymt2 = 腾讯混元 Hy-MT2-1.8B，走 PyTorch）---
-# torch 的 CUDA 轮子体积较大（约 2.5GB），安装器会自动装；只想用 CT2 引擎可以不装
+# torch 的轮子体积较大（约 2.5GB），安装器会自动装；只想用 CT2 引擎可以不装
 torch
 transformers==5.17.0        # Hy-MT2 需要（transformers>=5.6 + trust_remote_code）
 fireredvad==0.0.2           # 导出 FireRedVAD ONNX 用（默认 VAD 首次安装时导一次）
 
 # --- 可选：不装也能跑，只影响对应功能 ---
 librosa==0.10.2             # 仅 Qwen3-ASR（ONNX）识别后端需要
-funasr_onnx==0.4.3          # 仅「接缝标点 = CPU 模型」需要；缺了自动改用 Qwen
 websocket-client==1.9.2     # 仅「火山引擎流式识别（WebSocket）」后端需要
+
+# ============================================================================
+# 下面两个包**不能**跟着上面一起装（2026-09-17 新用户实测踩出）：
+#
+# 1) faster-whisper==1.2.1   （识别引擎，必需）
+#    它声明依赖 CPU 版 onnxruntime。按常规装法会把 CPU 版和我们钉的
+#    onnxruntime-gpu==1.23.2 装进**同一个 site-packages**（两个 wheel 都提供同名的
+#    onnxruntime 包），谁后装谁覆盖：GPU provider 失效，DLL 与 .pyd 版本还可能错配
+#    （本项目本来就吃过原生崩溃的亏）。所以 --no-deps 装，再靠 onnxruntime-gpu
+#    提供同名的 onnxruntime 模块 —— 它其余的依赖（ctranslate2 / huggingface-hub /
+#    tokenizers / av / tqdm）上面都已显式列出。
+#
+# 2) funasr-onnx==0.4.3      （可选：中文补标点走 CPU 小模型 / FSMN VAD）
+#    它声明 numpy<=1.26.4，与本项目的 numpy==2.5.3 **解析无解**（这个上限是上游过时的
+#    元数据，实测 0.4.3 配 numpy 2.x 正常工作）。它也声明 onnxruntime，理由同上。
+#    它的依赖里只有 jieba 是上面没有的，一并补。
+#
+# 正确装法（scripts/setup_first_run.py 里自动做，也就是安装器的"[2/5] 单独装"那步）：
+#   .venv\Scripts\python.exe -m pip install --no-deps -i https://mirrors.aliyun.com/pypi/simple/ faster-whisper==1.2.1
+#   .venv\Scripts\python.exe -m pip install --no-deps -i https://mirrors.aliyun.com/pypi/simple/ funasr-onnx==0.4.3 jieba
+# （用 uv 建的环境没有 pip，把上面两条的 ".venv\Scripts\python.exe -m pip install" 换成
+#   "uv pip install --python .venv\Scripts\python.exe"，并把 -i 写成 --index-url）
+# ============================================================================

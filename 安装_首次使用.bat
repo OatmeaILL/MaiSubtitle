@@ -17,7 +17,9 @@ if exist ".venv\Scripts\python.exe" goto hasvenv
 echo [1/2] 建 Python 环境 .venv（Python 3.12）...
 where uv >nul 2>nul
 if not errorlevel 1 (
-    uv venv --python 3.12 .venv
+    rem --seed：顺手把 pip 装进 venv —— uv 建的 venv 默认不带 pip，后面装依赖要用
+    uv venv --python 3.12 --seed .venv
+    if not exist .venv\Scripts\python.exe uv venv --python 3.12 .venv
     goto checkvenv
 )
 where py >nul 2>nul

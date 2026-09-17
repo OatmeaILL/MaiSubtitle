@@ -8,23 +8,30 @@ Windows 上的实时字幕翻译。捕获系统正在播放的声音，分句后
 
 ## 安装
 
-要求：Windows 10/11 64 位，NVIDIA 显卡（建议 6GB 显存以上），约 8GB 磁盘空间。
+要求：Windows 10/11 64 位，NVIDIA 显卡（建议 6GB 显存以上），约 9GB 磁盘空间（再装可选模型约 13GB）。
 
 1. 双击 `安装_首次使用.bat`。它负责建环境、装依赖、下模型、导出 VAD、自检；重复运行不会重复下载。
 2. 装完双击 `启动_MaiSubtitle.bat`。
 
-下载内容：Whisper large-v3-turbo（识别）、Hy-MT2-1.8B（翻译）、FireRedVAD（分句），
-加上依赖（含 PyTorch），合计约 7GB，首次安装比较慢。想先看缺什么、不下载：`安装_首次使用.bat --check`。
+下载内容：Whisper large-v3-turbo（识别，1.5GB）、Hy-MT2-1.8B（翻译，3.9GB）、FireRedVAD（分句），
+加上依赖（含 PyTorch，约 3GB），合计约 8GB，首次安装比较慢。想先看缺什么、不下载：`安装_首次使用.bat --check`。
 
 <details>
 <summary>手动安装（不用 bat 的话）</summary>
 
 ```
-uv venv --python 3.12 .venv          # 没装 uv 就改用 python -m venv .venv
+uv venv --python 3.12 --seed .venv   # --seed 顺带装 pip（uv 建的 venv 默认没有）；没装 uv 就用 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+.venv\Scripts\python.exe -m pip install --no-deps faster-whisper==1.2.1 -i https://mirrors.aliyun.com/pypi/simple/
+.venv\Scripts\python.exe -m pip install --no-deps funasr-onnx==0.4.3 jieba -i https://mirrors.aliyun.com/pypi/simple/
 .venv\Scripts\python.exe scripts/download_models.py --only whisper_turbo silero_vad firered hymt2
 .venv\Scripts\python.exe scripts/model_manager.py export firered
 ```
+
+后两条 `--no-deps` 不能省也不能并进上一条：`faster-whisper` 会顺带装 CPU 版 onnxruntime
+把 `onnxruntime-gpu` 覆盖掉，`funasr-onnx` 则声明了与本项目冲突的 numpy 版本。
+原因写在 `requirements.txt` 末尾。用 uv 建的 venv 没有 pip 时，把 `.venv\Scripts\python.exe -m pip install`
+换成 `uv pip install --python .venv\Scripts\python.exe`、`-i` 换成 `--index-url`。
 </details>
 
 四个启动器：
@@ -102,6 +109,7 @@ Esc 没有绑定功能，退出用托盘菜单。
 | 延迟大 | 设置 → 分句 → 低延迟预设 |
 | 中文视频没有译文 | 中文不翻译；F5 切到 zh 时只出原文，这是预期行为 |
 | 缺模型 | `安装_首次使用.bat --check` 会列出缺什么以及对应命令 |
+| 下载模型失败 | 报错会写 `[fail] 项名（缺 哪个文件）`。脚本按 HF 镜像 → 官方源 → ModelScope 镜像依次试；都不通就按提示把权重手动放进 `models/` 里对应目录 |
 | 卡住或闪退 | 已知问题，守护进程会在心跳超时 25 秒后自动重启 |
 
 ## 其它
@@ -120,4 +128,5 @@ Esc 没有绑定功能，退出用托盘菜单。
 .venv\Scripts\python.exe scripts/gpu_probe.py
 ```
 
-代码许可是 MIT，见 `LICENSE`。模型权重不在仓库里，由脚本从各自官方源下载，许可随上游项目。
+代码许可是 MIT，见 `LICENSE`。模型权重不在仓库里，由脚本下载（依次尝试 HF 镜像、官方源、
+ModelScope 镜像），许可随上游项目。

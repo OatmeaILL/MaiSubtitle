@@ -35,17 +35,27 @@ GH_PROXIES = ["", "https://ghfast.top/", "https://gh-proxy.com/", "https://ghpro
 
 # ---------------------------------------------------------------- HF 模型清单
 # dest 相对 MODELS_DIR；patterns 为空表示整个仓库快照
+# need = 下完**必须存在**的文件：hf_hub 在"远端不可达但 local_dir 已有文件"时会
+#        直接返回、不抛异常（见 download_hf 注释），不逐文件校验就会把"没下到"报成 OK。
 HF_MODELS = {
     # Whisper large-v3-turbo（faster-whisper 版）：全项目唯一 whisper 权重，**识别必需**。
+    # ⚠ repo id 不能想当然写 Systran/...：2026-09-17 实测 hf-mirror / aifasthub 对它一律
+    #   **401**（resolve 接口 404 RepoNotFound），官方 hf.co 在开发机连不上。开发时实际用的
+    #   是这个 **dropbox-dash** 仓库（就是 models/ 里那份权重的 README 自己写的来源），
+    #   hf-mirror 上 200、文件集一致（model.bin 1543MB + config/tokenizer/vocabulary）。
     "whisper_turbo": {
-        "repo": "Systran/faster-whisper-large-v3-turbo",
+        "repo": "dropbox-dash/faster-whisper-large-v3-turbo",
         "dest": "faster-whisper-large-v3-turbo",
+        "need": ["model.bin", "config.json", "tokenizer.json"],
+        # 保险丝：hf-mirror 万一也挂，回退 ModelScope 上的同款权重（实测 200，文件集一致）。
+        "ms_fallback": "pengzhendong/faster-whisper-large-v3-turbo",
     },
     # Qwen3-ASR-0.6B 的 ONNX INT4 导出：**备选识别后端**（设置里选 Qwen3-ASR 才需要）。
     # 只存在于 HuggingFace（ModelScope 无镜像）。
     "qwen3_asr_0_6b_onnx_int4": {
         "repo": "vrfai/Qwen3-ASR-0.6B-int4",
         "dest": "qwen3-asr-0.6b-onnx-int4",
+        "need": ["config.json", "tokenizer.json", "encoder.int4.onnx"],
     },
 }
 
@@ -81,10 +91,12 @@ MS_MODELS = {
     },
     # 腾讯混元 Hy-MT2-1.8B（**默认翻译引擎 hymt2 的权重**，Apache-2.0，约 4.1GB）：
     # 架构 HunYuanDenseV1ForCausalLM 不被 CTranslate2 支持 → 只能走 transformers/PyTorch，
-    # 所以它需要 torch（安装器会一起装）
+    # 所以它需要 torch（安装器会一起装）。need 必须是真权重（3888MB 的 model.safetensors），
+    # 不能只看 config.json —— 那只证明"目录建出来了"。
     "hymt2": {
         "repo": "Tencent-Hunyuan/Hy-MT2-1.8B",
         "dest": "Hy-MT2-1.8B",
+        "need": ["model.safetensors", "tokenizer.json"],
     },
 }
 
@@ -93,38 +105,90 @@ GITHUB_ASSETS = {
     "silero_vad": {
         "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
         "dest": "silero_vad.onnx",
+        # 校验门槛：代理链在直连失败时会回一个 **假 200 的 HTML 错误页**
+        # （2026-09-17 实测：6,990 字节、以 `<!-- 62982819547` 开头）。
+        # 只判"文件非空"会把垃圾当模型装进 models/，直到运行期加载 VAD 才炸。
+        # 真文件 643,854 字节（ONNX/protobuf 二进制）。
+        "min_size": 500_000,
     },
 }
 
 
-def target_present(name: str) -> bool:
-    """目标是否真实存在（防 state 说谎：本地文件被删/移走后 state 仍记 "ok"）。
+def spec_of(name: str) -> dict:
+    return HF_MODELS.get(name) or MS_MODELS.get(name) or GITHUB_ASSETS.get(name) or {}
 
-    state 只记"下载成功过"，不做清理；若模型目录被手动删除，必须重新下载。
+
+def looks_like_error_page(p: Path) -> bool:
+    """像不像代理/网关塞回来的 HTML 错误页（而不是模型文件）。
+
+    实测：github release 直连 502 时，代理会正常返回 200 + 一段 HTML
+    （6,990 字节，以 `<!--` 开头）→ curl 退出码是 0，光看"文件非空"根本发现不了。
+    真模型是二进制（ONNX/protobuf），既不会以 '<' 开头，也不会整段能 UTF-8 解码。
     """
-    if name in HF_MODELS:
-        p = MODELS_DIR / HF_MODELS[name]["dest"]
-    elif name in MS_MODELS:
-        p = MODELS_DIR / MS_MODELS[name]["dest"]
-    elif name in GITHUB_ASSETS:
-        p = MODELS_DIR / GITHUB_ASSETS[name]["dest"]
-    else:
-        return False
-    if p.is_file():
-        return p.stat().st_size > 0
-    return p.is_dir() and any(p.iterdir())
+    head = p.read_bytes()[:512]
+    if not head:
+        return True
+    if head.lstrip()[:1] == b"<":
+        return True
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False                 # 二进制 → 不是错误页
+    return True                      # 纯文本 → 当错误页处理
+
+
+def missing_files(name: str) -> list:
+    """目标里还缺什么；空列表 = 齐了。
+
+    · 有 need 的**逐文件**查（HF 模型：只下了一半也算缺）；
+    · 文件型资产查"体积够不够 + 内容像不像模型"（防假 200 错误页）；
+    · 其余只要求"存在且非空"。
+    """
+    spec = spec_of(name)
+    if not spec:
+        return ["(未知项)"]
+    dest = MODELS_DIR / spec["dest"]
+    if not dest.exists():
+        return ["(目录不存在)"]
+    need = spec.get("need")
+    if need:
+        return [f for f in need
+                if not (dest / f).is_file() or (dest / f).stat().st_size == 0]
+    if dest.is_file():
+        size = dest.stat().st_size
+        if size == 0:
+            return ["(空文件)"]
+        if size < spec.get("min_size", 0):
+            return [f"(体积异常 {size} 字节)"]
+        if looks_like_error_page(dest):
+            return ["(内容不是模型，疑似代理错误页)"]
+        return []
+    return [] if any(dest.iterdir()) else ["(目录为空)"]
+
+
+def target_present(name: str) -> bool:
+    """目标是否真的可用（防 state 说谎：本地被删/移走，或当初只下了一半）。
+
+    state 只记"下载成功过"，从不清理；所以除了"目录在不在"，HF 模型还要看关键文件。
+    """
+    return not missing_files(name)
 
 
 def download_ms(name: str, spec: dict) -> bool:
+    """ModelScope 快照下载。同样要逐文件校验 —— 中断/限流会留下半份目录，
+    而"目录非空"看起来和"下好了"一模一样。"""
     from modelscope import snapshot_download as ms_download
     local = MODELS_DIR / spec["dest"]
     for attempt in range(3):
         try:
             ms_download(spec["repo"], local_dir=str(local))
-            return True
+            miss = missing_files(name)
+            if not miss:
+                return True
+            print(f"  [retry {attempt + 1}/3] {name}: 下完仍缺 {miss}")
         except Exception as e:
             print(f"  [retry {attempt + 1}/3] {name}: {str(e)[:150]}")
-            time.sleep(5 * (attempt + 1))
+        time.sleep(5 * (attempt + 1))
     print(f"  [fail] {name}")
     return False
 
@@ -140,33 +204,60 @@ def save_state(state: dict):
 
 
 def download_hf(name: str, spec: dict) -> bool:
-    """HF 快照下载：默认走镜像（env HF_ENDPOINT，缺省 hf-mirror.com），失败回退官方源。"""
+    """HF 快照下载：镜像（env HF_ENDPOINT，缺省 hf-mirror.com）→ 官方源 → ModelScope 镜像。
+
+    ⚠ hf_hub 的坑（2026-09-17 实测）：远端不可达但 local_dir 里已有文件时，
+    `snapshot_download` **不抛异常**，只打印一句 "Returning existing local_dir `…`
+    as remote repo cannot be accessed" 就正常返回（见 huggingface_hub/_snapshot_download.py）。
+    所以每次调用后必须 missing_files() 真查一遍文件，否则会把"其实什么都没下到"报成 OK。
+    """
     from huggingface_hub import snapshot_download
     local = MODELS_DIR / spec["dest"]
     local.mkdir(parents=True, exist_ok=True)
-    endpoints = [None, "https://huggingface.co"]      # None = 用 env 里的镜像
-    for ep in endpoints:
+    channels = [(None, "镜像"), ("https://huggingface.co", "官方源")]   # None = 用 env 里的镜像
+    for ep, label in channels:
         for attempt in range(2):
             try:
                 kw = {"allow_patterns": spec.get("patterns") or None, "max_workers": 4}
                 if ep:
                     kw["endpoint"] = ep
                 snapshot_download(repo_id=spec["repo"], local_dir=local, **kw)
-                if ep:
-                    print(f"  [ok] {name}（回退官方源成功）")
-                return True
+                miss = missing_files(name)
+                if not miss:
+                    if ep:
+                        print(f"  [ok] {name}（回退官方源成功）")
+                    return True
+                print(f"  [warn] {label} 跑完仍缺 {miss}")
+                break                      # 同一通道再试也是同样结果 → 换下一个
             except Exception as e:
                 if spec.get("optional"):
                     print(f"  [skip] {name}: {str(e)[:120]}")
                     return True
-                print(f"  [retry {ep or '镜像'} {attempt + 1}/2] {name}: {str(e)[:120]}")
+                print(f"  [retry {label} {attempt + 1}/2] {name}: {str(e)[:120]}")
                 time.sleep(3 * (attempt + 1))
-    print(f"  [fail] {name}")
+    ms_repo = spec.get("ms_fallback")
+    if ms_repo:
+        print(f"  [hf 不通] {name} → 回退 ModelScope 镜像 {ms_repo}")
+        if download_ms(name, {"repo": ms_repo, "dest": spec["dest"]}):
+            miss = missing_files(name)
+            if not miss:
+                print(f"  [ok] {name}（ModelScope 镜像成功）")
+                return True
+            print(f"  [warn] ModelScope 镜像跑完仍缺 {miss}")
+    miss = missing_files(name)
+    print(f"  [fail] {name}" + (f"（缺 {'、'.join(miss)}）" if miss else ""))
+    print(f"         手动补救：把该模型的权重文件放进 {MODELS_DIR / spec['dest']}")
     return False
 
 
-def gh_download(url: str, dest: Path, tries: int = 3) -> bool:
-    """GitHub 资产下载：直连失败自动切代理链。"""
+def gh_download(name: str, spec: dict, tries: int = 3) -> bool:
+    """GitHub 资产下载：直连失败自动切代理链。
+
+    每次下完都过 missing_files() 那套校验（体积 + 内容），不合格就删掉、换下一个代理 ——
+    curl 的 `--fail` 只挡得住 4xx/5xx，挡不住"200 + HTML 错误页"。
+    """
+    url = spec["url"]
+    dest = MODELS_DIR / spec["dest"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(tries):
         for proxy in GH_PROXIES:
@@ -177,13 +268,12 @@ def gh_download(url: str, dest: Path, tries: int = 3) -> bool:
                      "-o", str(dest), full],
                     capture_output=True, text=True,
                 )
-                if r.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
-                    # 代理可能返回假 200 错误页：校验大小与 zip 完整性
-                    size = dest.stat().st_size
-                    if size < 1024 * 1024 and url.endswith(".zip"):
-                        print(f"    [warn] {proxy} 返回疑似错误页 ({size}B)，跳过")
-                        continue
+                if r.returncode == 0 and not missing_files(name):
                     return True
+                if dest.exists():
+                    dest.unlink()            # 别把半截/假文件留在 models/ 里
+                if r.returncode == 0:
+                    print(f"    [warn] {proxy or 'direct'} 返回的不是模型文件，换下一个通道")
             except Exception:
                 pass
         time.sleep(3 * (attempt + 1))
@@ -191,12 +281,12 @@ def gh_download(url: str, dest: Path, tries: int = 3) -> bool:
 
 
 def download_github_asset(name: str, spec: dict) -> bool:
-    dest = MODELS_DIR / spec["dest"]
-    if dest.exists() and dest.stat().st_size > 0:
+    if not missing_files(name):              # 已下好（含体积/内容校验）
         return True
-    ok = gh_download(spec["url"], dest)
+    ok = gh_download(name, spec)
     if ok:
-        print(f"  [ok] {name} -> {dest.name} ({dest.stat().st_size // 1024} KB)")
+        print(f"  [ok] {name} -> {spec['dest']} "
+              f"({(MODELS_DIR / spec['dest']).stat().st_size // 1024} KB)")
     else:
         print(f"  [fail] {name}")
     return ok

@@ -18,3 +18,6 @@ glossary.csv
 
 # 本地配置（会存 API Key 等私密信息）：仓库里给的是 config.example.json 模板
 config.json
+
+# Windows 快捷方式（本机自己建的，不是仓库内容）
+*.lnk
