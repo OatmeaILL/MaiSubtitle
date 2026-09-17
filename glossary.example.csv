@@ -1,0 +1,4 @@
+src_lang,source,aliases,target_zh,force,priority,note,use
+en,Steam,,,,1,示例：平台名——只用于翻译，不喂给识别,mt
+ja,リューネル,リューネ,琉涅尔,建议,2,示例：人名；aliases 填"识别听错过的写法",both
+en,wuthering waves,wuuing waves,鸣潮,建议,2,示例：游戏名（术语按句裁剪，不会硬塞进译文）,both

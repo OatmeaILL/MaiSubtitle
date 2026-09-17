@@ -1,0 +1,20 @@
+models/
+logs/
+testdata/
+tools/
+__pycache__/
+dist/
+MaiSubtitle.exe
+_internal/
+.workbuddy/
+.zcode/
+.idea/
+.vscode/
+*.pyc
+dev/ref/
+
+# 术语库是用户自己的数据，不进 git（仓库里给的是 glossary.example.csv 样例）
+glossary.csv
+
+# 本地配置（会存 API Key 等私密信息）：仓库里给的是 config.example.json 模板
+config.json

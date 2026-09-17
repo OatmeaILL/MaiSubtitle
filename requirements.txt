@@ -1,0 +1,45 @@
+# MaiSubtitle 运行时依赖（Windows / Python 3.12）
+# 安装：.venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+#  **不需要 torch**：本项目只用 CT2 / ONNX 推理。
+#   只有"把 HuggingFace 权重转成 CT2"（首次准备翻译模型，scripts/convert_qwen_ct2.py）
+#   那一步才要 transformers + torch —— 想省事就直接把现成的 CT2 目录放进 models/。
+
+# --- 界面 / 系统 ---
+PyQt6==6.11.0
+keyboard==0.13.5            # 全局热键
+psutil==7.2.2               # 孤儿 GPU 子进程清扫
+pynvml                      # 显存日志（缺了自动跳过）
+comtypes==1.4.16            # PyAudioWPatch 依赖
+PyAudioWPatch==0.2.12.8     # WASAPI 环回采集（系统声音）
+
+# --- 音频 / 解码 ---
+numpy==2.5.3
+av==18.1.0                  # 媒体文件解码（离线转写）
+soundfile==0.14.0
+soxr==1.1.0
+
+# --- 识别 ---
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+tokenizers==0.23.2
+Jinja2==3.1.6               # 对话模板渲染（轻量 tokenizer）
+onnxruntime-gpu==1.23.2     # VAD / Qwen3-ASR 的 ONNX 推理（无 NVIDIA 卡可改装 onnxruntime）
+kaldi-native-fbank==1.22.3  # FireRedVAD 特征
+sentencepiece==0.2.2
+
+# --- 翻译 / 文本 ---
+zhconv==1.4.3               # 繁→简
+RapidFuzz==3.14.6           # 术语模糊匹配
+
+# --- 模型下载 ---
+modelscope==1.40.0
+huggingface-hub==1.31.0
+tqdm==4.70.0
+requests==2.34.2
+protobuf==7.36.1
+
+# --- 可选：不装也能跑，只影响对应功能 ---
+librosa==0.10.2             # 仅 Qwen3-ASR（ONNX）识别后端需要
+funasr_onnx==0.4.3          # 仅「接缝标点 = CPU 模型」需要；缺了自动改用 Qwen
+websocket-client==1.9.2     # 仅「火山引擎流式识别（WebSocket）」后端需要
