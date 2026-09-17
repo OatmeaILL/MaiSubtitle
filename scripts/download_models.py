@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +114,59 @@ GITHUB_ASSETS = {
     },
 }
 
+
+# ---------------------------------------------------------------- 通道测速
+# 同一份权重 HF 镜像与 ModelScope 常常都有，但速度能差好几倍
+# （2026-09-18 实测：hf-mirror 单连接 ~3MB/s，ModelScope ~18MB/s → 1.5GB 的 whisper
+# 相差约 7 分钟）。所以有双通道的项先各读几 MB 量一下，明显更快的那边先用。
+# 只在"快 2 倍以上"才换源：默认仍以**开发时验证过的 HF 源**为准。
+CHANNEL_PROBE = {
+    "hf": "https://hf-mirror.com/dropbox-dash/faster-whisper-large-v3-turbo/resolve/main/model.bin",
+    "ms": ("https://modelscope.cn/api/v1/models/Tencent-Hunyuan/Hy-MT2-1.8B/repo"
+           "?Revision=master&FilePath=model.safetensors"),
+}
+PROBE_MB = 4                 # 每个通道最多读这么多
+PROBE_SECONDS = 5.0          # 每个通道最多花这么多秒
+SWITCH_FACTOR = 2.0          # ModelScope 至少快 2 倍才优先用它
+_SPEED = {}                  # 测速结果缓存
+
+
+def host_speed(url: str) -> float:
+    """读最多 PROBE_MB / PROBE_SECONDS 估算 MB/s；失败或读不到数据返回 0。"""
+    got = 0
+    t0 = time.perf_counter()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "MaiSubtitle-download"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            while got < PROBE_MB * 1024 * 1024:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if time.perf_counter() - t0 > PROBE_SECONDS:
+                    break
+    except Exception:
+        pass
+    dt = time.perf_counter() - t0
+    if dt <= 0 or got == 0:
+        return 0.0
+    return got / 1048576 / dt
+
+
+def prefer_model_scope(spec: dict) -> bool:
+    """有 ms_fallback 的项：ModelScope 明显更快就先试它（各自只测一次，进程内缓存）。"""
+    if not spec.get("ms_fallback"):
+        return False
+    for key, url in CHANNEL_PROBE.items():
+        if key not in _SPEED:
+            _SPEED[key] = host_speed(url)
+    hf_speed = _SPEED.get("hf", 0.0)
+    ms_speed = _SPEED.get("ms", 0.0)
+    print(f"  [测速] HF 镜像 {hf_speed:.1f} MB/s ｜ ModelScope {ms_speed:.1f} MB/s")
+    return ms_speed > hf_speed * SWITCH_FACTOR
+
+
+# ---------------------------------------------------------------- 下载判定
 
 def spec_of(name: str) -> dict:
     return HF_MODELS.get(name) or MS_MODELS.get(name) or GITHUB_ASSETS.get(name) or {}
@@ -316,7 +370,13 @@ def main():
             print(f"[stale] {name}（state 记为已下载，但本地不存在 → 重新下载）")
         print(f"[down] {name} ...")
         if name in HF_MODELS:
-            ok = download_hf(name, HF_MODELS[name])
+            spec = HF_MODELS[name]
+            ok = False
+            if prefer_model_scope(spec):
+                print(f"  [换源] ModelScope 快得多 → 先用它下 {name}")
+                ok = download_ms(name, {"repo": spec["ms_fallback"], "dest": spec["dest"]})
+            if not ok:
+                ok = download_hf(name, spec)
         elif name in MS_MODELS:
             ok = download_ms(name, MS_MODELS[name])
         elif name in GITHUB_ASSETS:

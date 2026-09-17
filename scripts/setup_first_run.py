@@ -14,7 +14,11 @@
 （`安装_首次使用.bat` 会依次判断 uv / py / python，建好 .venv 后调本脚本。）
 
 幂等：已装的依赖由装包器自己判、已下的模型判标志文件、导出过的判 onnx 文件；
-重复运行不会重复下载。所有下载走**阿里云镜像**。
+重复运行不会重复下载。
+
+**PyPI 源先测速再选**：候选四家（清华 / 中科大 / 腾讯云 / 阿里云）各读几 MB 量一次速度，
+用最快的那家装依赖 —— 实测同一 torch wheel 差 100 倍（0.22 vs 24 MB/s，2.5GB 差 3 小时），
+所以不能写死一家。要指定就 `--mirror 清华`（或任何 index URL、或环境变量 MAISUB_PYPI_MIRROR）。
 
 两个实测过的安装坑（新用户第一次装必撞，已在这里兜住）：
   ① **uv 建的 .venv 里没有 pip**：uv 用自己的 `uv pip` 管包，venv 的 site-packages 里
@@ -27,18 +31,36 @@
      requirements.txt 末尾。
 """
 import argparse
+import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
 VENV_PY = VENV / "Scripts" / "python.exe"
 REQ = ROOT / "requirements.txt"
-PIP_MIRROR = "https://mirrors.aliyun.com/pypi/simple/"
-PIP_HOST = "mirrors.aliyun.com"
+
+# ---- PyPI 源：**先测速再选**（2026-09-18 实测，同一 numpy wheel / torch 前 20MB）----
+#   清华 24.2 / 中科大 18.9 / 腾讯云 11.0 / 阿里云 **0.22** MB/s —— 差 100 倍，
+#   而 torch 一只就 2.5GB（阿里云要 3 小时，清华 1.7 分钟）。**别写死一家。**
+PYPI_MIRRORS = [
+    ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple/", "pypi.tuna.tsinghua.edu.cn"),
+    ("中科大", "https://mirrors.ustc.edu.cn/pypi/simple/", "mirrors.ustc.edu.cn"),
+    ("腾讯云", "https://mirrors.cloud.tencent.com/pypi/simple/", "mirrors.cloud.tencent.com"),
+    ("阿里云", "https://mirrors.aliyun.com/pypi/simple/", "mirrors.aliyun.com"),
+]
+PROBE_PKG = "numpy"                # 测速用的包：各镜像都有，wheel 十几 MB，够读几秒
+PROBE_BYTES = 4 * 1024 * 1024      # 每个镜像最多读这么多
+PROBE_SECONDS = 5.0                # 每个镜像最多花这么多秒
+
+FORCED_MIRROR = os.environ.get("MAISUB_PYPI_MIRROR", "")   # 非空 = 跳过测速直接用
+_MIRROR = None                     # 测速结果缓存（名称, index_url, host）
 
 # 启动必需的关键 import（对应 requirements.txt 里"能一把装上"的那些）
 CORE_IMPORTS = [
@@ -120,6 +142,87 @@ def torch_ok(py: Path | None = None) -> bool:
                           capture_output=True, cwd=str(ROOT)).returncode == 0
 
 
+# ---------------- PyPI 源：先测速，再选最快的 ----------------
+
+def speedtest_mirror(index_url: str) -> tuple:
+    """量一个源的速度：从它的索引里挑个 wheel，读几 MB 计时。返回 (MB/s, 说明)。"""
+    idx = index_url + PROBE_PKG + "/"
+    ua = {"User-Agent": "MaiSubtitle-setup"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(idx, headers=ua), timeout=8) as r:
+            html = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        return 0.0, f"索引不通（{type(e).__name__}）"
+    links = [urllib.parse.urljoin(idx, l) for l in re.findall(r'href="([^"#]+)', html)]
+    url = ""
+    for pref in ("cp312-cp312-win_amd64.whl", "cp312-abi3-win_amd64.whl", "py3-none-any.whl"):
+        for link in links:
+            if pref in link:
+                url = link
+                break
+        if url:
+            break
+    if not url:
+        return 0.0, "索引里没有可用 wheel"
+    got = 0
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=ua), timeout=8) as r:
+            while got < PROBE_BYTES:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if time.perf_counter() - t0 > PROBE_SECONDS:
+                    break
+    except Exception:
+        if got == 0:                      # 一个字节都没读到才算失败（读到一半断按已读的算）
+            return 0.0, "下载不通"
+    dt = time.perf_counter() - t0
+    if dt <= 0 or got == 0:
+        return 0.0, "没读到数据"
+    speed = got / 1048576 / dt
+    return speed, f"{got / 1048576:4.1f} MB / {dt:4.1f}s = {speed:5.1f} MB/s"
+
+
+def pick_mirror() -> tuple:
+    """四个候选各测一次速，取最快的。返回 (名称, index_url, host)。"""
+    say("      先测速挑 PyPI 源（每个源读几 MB，别写死一家）：")
+    best = (0.0, "", "", "")
+    for name, url, host in PYPI_MIRRORS:
+        speed, note = speedtest_mirror(url)
+        say(f"        {name:6} {note}")
+        if speed > best[0]:
+            best = (speed, name, url, host)
+    if best[0] <= 0:
+        name, url, host = PYPI_MIRRORS[0]
+        say(f"        都没测出速度 → 回落到 {name}")
+        return name, url, host
+    say(f"        → 用 {best[1]}（{best[0]:.1f} MB/s）")
+    return best[1], best[2], best[3]
+
+
+def mirror() -> tuple:
+    """当前要用的 PyPI 源（第一次调用时测速，之后缓存）。"""
+    global _MIRROR
+    if _MIRROR is None:
+        if FORCED_MIRROR:
+            url = FORCED_MIRROR
+            if "//" not in url:                       # 允许只写源名
+                for name, u, host in PYPI_MIRRORS:
+                    if name == FORCED_MIRROR:
+                        url, host = u, host
+                        break
+                else:
+                    url = "https://" + FORCED_MIRROR + "/simple/"
+            host = url.split("//")[-1].split("/")[0]
+            say(f"      PyPI 源：{url}（手动指定，跳过测速）")
+            _MIRROR = ("指定", url, host)
+        else:
+            _MIRROR = pick_mirror()
+    return _MIRROR
+
+
 # ---------------- 装包（三级兜底：pip → uv pip → ensurepip）----------------
 
 def pip_ready(py: Path) -> bool:
@@ -146,8 +249,9 @@ def installer_kind(py: Path | None = None) -> str:
 
 
 def _run_pip(py: Path, args: list, no_deps: bool) -> int:
+    _, index_url, host = mirror()
     cmd = [py, "-m", "pip", "install", *args,
-           "-i", PIP_MIRROR, "--trusted-host", PIP_HOST,
+           "-i", index_url, "--trusted-host", host,
            "--disable-pip-version-check"]
     if no_deps:
         cmd.append("--no-deps")
@@ -157,12 +261,13 @@ def _run_pip(py: Path, args: list, no_deps: bool) -> int:
 def pip_install(args: list, py: Path | None = None, no_deps: bool = False) -> int:
     """装包：venv 自带 pip → uv pip → ensurepip 补 pip 再装。都失败返回非 0。"""
     py = py or VENV_PY
+    _, index_url, _ = mirror()
     kind = installer_kind(py)
     if kind == "pip":
         return _run_pip(py, args, no_deps)
     if kind == "uv":
         say("      （这个 .venv 里没有 pip —— uv 建的 venv 默认不带；改用 uv pip 安装）")
-        cmd = ["uv", "pip", "install", "--python", py, *args, "--index-url", PIP_MIRROR]
+        cmd = ["uv", "pip", "install", "--python", py, *args, "--index-url", index_url]
         if no_deps:
             cmd.append("--no-deps")
         if run(cmd) == 0:
@@ -200,6 +305,9 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
         return False
     kind = installer_kind()
     say(f"装包器  : {KIND_TEXT.get(kind, kind)}")
+    if not fix:
+        say("PyPI 源 : 真装时先测速，用最快的一家（清华 / 中科大 / 腾讯云 / 阿里云；"
+            "可用 --mirror 指定）")
 
     ok = True
     # ---- 1. 依赖（requirements.txt，能一把装上的那些）----
@@ -210,10 +318,11 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
         if miss:
             say(f"\n[1/5] 依赖：缺 {len(miss)} 个 → {' '.join(miss)}")
             if fix:
-                say(f"      安装 requirements.txt（阿里云镜像，首次约 {CHUNK_GB / 2:.0f} 分钟）…")
+                name, _, _ = mirror()          # 先测速选源（打印各源速度）
+                say(f"      用「{name}」装 requirements.txt（缺 {len(miss)} 个，约 3GB 含 torch）…")
                 if pip_install(["-r", str(REQ)]) != 0:
                     say("      [错误] 装依赖失败：看上面的报错（网络/镜像问题居多）；"
-                        "网络不通可改用其他 pip 源重试")
+                        "可换一家源重试：安装_首次使用.bat --mirror 清华")
                     return False
                 miss = missing_imports(CORE_IMPORTS)
                 if miss:
@@ -311,7 +420,14 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true", help="不询问，直接开干")
     ap.add_argument("--skip-deps", action="store_true", help="跳过装依赖")
     ap.add_argument("--skip-models", action="store_true", help="跳过下模型/转换")
+    ap.add_argument("--mirror", default="", metavar="源",
+                    help="强制 PyPI 源（清华 / 中科大 / 腾讯云 / 阿里云，或完整 index URL）；"
+                         "默认自动测速选最快")
     a = ap.parse_args()
+
+    global FORCED_MIRROR
+    if a.mirror:
+        FORCED_MIRROR = a.mirror
 
     if a.check:
         report(fix=False)

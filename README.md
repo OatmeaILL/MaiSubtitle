@@ -16,14 +16,19 @@ Windows 上的实时字幕翻译。捕获系统正在播放的声音，分句后
 下载内容：Whisper large-v3-turbo（识别，1.5GB）、Hy-MT2-1.8B（翻译，3.9GB）、FireRedVAD（分句），
 加上依赖（含 PyTorch，约 3GB），合计约 8GB，首次安装比较慢。想先看缺什么、不下载：`安装_首次使用.bat --check`。
 
+依赖和模型都会**先测速再选源**（PyPI：清华 / 中科大 / 腾讯云 / 阿里云；模型：HF 镜像 / ModelScope），
+不用你操心。想指定 PyPI 源：`安装_首次使用.bat --mirror 清华`。
+
 <details>
 <summary>手动安装（不用 bat 的话）</summary>
 
 ```
+# 源用清华（实测最快）。别用默认源：同一只 torch wheel 实测 0.2MB/s vs 24MB/s，2.5GB 差 3 小时
+set M=https://pypi.tuna.tsinghua.edu.cn/simple/
 uv venv --python 3.12 --seed .venv   # --seed 顺带装 pip（uv 建的 venv 默认没有）；没装 uv 就用 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
-.venv\Scripts\python.exe -m pip install --no-deps faster-whisper==1.2.1 -i https://mirrors.aliyun.com/pypi/simple/
-.venv\Scripts\python.exe -m pip install --no-deps funasr-onnx==0.4.3 jieba -i https://mirrors.aliyun.com/pypi/simple/
+.venv\Scripts\python.exe -m pip install -r requirements.txt -i %M%
+.venv\Scripts\python.exe -m pip install --no-deps faster-whisper==1.2.1 -i %M%
+.venv\Scripts\python.exe -m pip install --no-deps funasr-onnx==0.4.3 jieba -i %M%
 .venv\Scripts\python.exe scripts/download_models.py --only whisper_turbo silero_vad firered hymt2
 .venv\Scripts\python.exe scripts/model_manager.py export firered
 ```
