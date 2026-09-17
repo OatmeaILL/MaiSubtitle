@@ -3,17 +3,18 @@
 Windows 上的实时字幕翻译。捕获系统正在播放的声音，分句后识别，译成中文，显示成悬浮字幕。
 
 - 识别英语 / 日语 / 韩语 / 中文
-- 本地推理，音频不出本机
-- 另有离线模式：视频文件 → 双语字幕（SRT / ASS）
+- 本地推理
+- 转换模式：视频文件 → 双语字幕（SRT / ASS）
 
 ## 安装
 
-要求：Windows 10/11 64 位，NVIDIA 显卡（建议 6GB 显存以上），约 4GB 磁盘空间。
+要求：Windows 10/11 64 位，NVIDIA 显卡（建议 6GB 显存以上），约 8GB 磁盘空间。
 
-1. 双击 `安装_首次使用.bat`。它负责建环境、装依赖、下模型、自检；重复运行不会重复下载。
+1. 双击 `安装_首次使用.bat`。它负责建环境、装依赖、下模型、导出 VAD、自检；重复运行不会重复下载。
 2. 装完双击 `启动_MaiSubtitle.bat`。
 
-想先看缺什么、不下载：`安装_首次使用.bat --check`。
+下载内容：Whisper large-v3-turbo（识别）、Hy-MT2-1.8B（翻译）、FireRedVAD（分句），
+加上依赖（含 PyTorch），合计约 7GB，首次安装比较慢。想先看缺什么、不下载：`安装_首次使用.bat --check`。
 
 <details>
 <summary>手动安装（不用 bat 的话）</summary>
@@ -21,14 +22,8 @@ Windows 上的实时字幕翻译。捕获系统正在播放的声音，分句后
 ```
 uv venv --python 3.12 .venv          # 没装 uv 就改用 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
-.venv\Scripts\python.exe scripts/download_models.py --only whisper_turbo silero_vad qwen_1_5b_hf
-.venv\Scripts\python.exe scripts/model_manager.py convert qwen_1_5b
-```
-
-最后一步要 torch，装 CPU 版即可：
-
-```
-.venv\Scripts\python.exe -m pip install torch --find-links https://mirrors.aliyun.com/pytorch-wheels/cpu/
+.venv\Scripts\python.exe scripts/download_models.py --only whisper_turbo silero_vad firered hymt2
+.venv\Scripts\python.exe scripts/model_manager.py export firered
 ```
 </details>
 
@@ -36,12 +31,12 @@ uv venv --python 3.12 .venv          # 没装 uv 就改用 python -m venv .venv
 
 | 文件 | 用途 |
 |---|---|
-| `安装_首次使用.bat` | 首次安装，环境坏了也用它修 |
+| `安装_首次使用.bat` | 首次安装/环境损坏使用 |
 | `启动_MaiSubtitle.bat` | 日常启动。无窗口，崩溃或卡死会自动重启 |
-| `启动_MaiSubtitle_控制台.bat` | 带控制台，排错时看报错 |
+| `启动_MaiSubtitle_控制台.bat` | 带控制台，排错 |
 | `启动_MaiSubtitle_调试.bat` | 调试模式，卡死 15 秒转储线程栈 |
 
-缺依赖或模型时启动器会停下来告诉你缺什么，不会毫无反应。可选组件（FireRedVAD、标点模型、Qwen3-ASR）不装也能用，会自动降级。
+缺依赖或模型时启动器会停下来告诉你缺什么，不会毫无反应。
 
 ## 默认配置
 
@@ -49,8 +44,8 @@ uv venv --python 3.12 .venv          # 没装 uv 就改用 python -m venv .venv
 
 | 项 | 默认 |
 |---|---|
-| 识别 / 翻译 | Whisper large-v3-turbo / hymt2（权重缺失自动降到 Qwen2.5-CT2） |
-| 分句 | FireRedVAD，单句上限 4 秒，断句静音 500 毫秒 |
+| 识别 / 翻译 / 分句 | Whisper large-v3-turbo / Hy-MT2-1.8B / FireRedVAD |
+| 单句上限 / 断句静音 | 4 秒 / 500 毫秒 |
 | 显示 | 实时出字，原文先上屏，每句停留 2 秒，历史 2 行 |
 | 音乐过滤 | 15% |
 
@@ -75,9 +70,9 @@ uv venv --python 3.12 .venv          # 没装 uv 就改用 python -m venv .venv
 |---|---|---|
 | qwen | Qwen2.5-1.5B-CT2 | 最快，约 0.22 秒每句 |
 | qwen3 | Qwen3-1.7B-CT2 | 约 0.37 秒每句 |
-| hymt2 | 混元 Hy-MT2-1.8B | 约 1.3 秒每句，需要自备权重 |
+| hymt2 | 混元 Hy-MT2-1.8B | 约 1.3 秒每句，默认引擎 |
 
-引擎全部不可用时只显示原文。
+引擎都不可用时只显示原文。
 
 分句（设置 → VAD 引擎）：`firered` 默认，切句最整；`fsmn` 备选；`silero` 切得最碎，但依赖最少。
 

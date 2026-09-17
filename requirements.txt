@@ -39,6 +39,12 @@ tqdm==4.70.0
 requests==2.34.2
 protobuf==7.36.1
 
+# --- 翻译（默认引擎 hymt2 = 腾讯混元 Hy-MT2-1.8B，走 PyTorch）---
+# torch 的 CUDA 轮子体积较大（约 2.5GB），安装器会自动装；只想用 CT2 引擎可以不装
+torch
+transformers==5.17.0        # Hy-MT2 需要（transformers>=5.6 + trust_remote_code）
+fireredvad==0.0.2           # 导出 FireRedVAD ONNX 用（默认 VAD 首次安装时导一次）
+
 # --- 可选：不装也能跑，只影响对应功能 ---
 librosa==0.10.2             # 仅 Qwen3-ASR（ONNX）识别后端需要
 funasr_onnx==0.4.3          # 仅「接缝标点 = CPU 模型」需要；缺了自动改用 Qwen

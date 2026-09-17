@@ -28,9 +28,10 @@ CATALOG = {
     "whisper_turbo":  ("whisper_turbo", "Whisper large-v3-turbo（识别）", "default", True),
     "qwen_1_5b":      ("qwen_1_5b_hf", "Qwen2.5-1.5B 官方权重（仅转换时需要；转好可删）",
                        "default", False),
-    "qwen_1_5b_ct2":  ("__converted__", "Qwen2.5-1.5B-CT2（翻译，默认引擎）", "default", True),
-    "firered":        ("__local__", "FireRedVAD ONNX（默认 VAD；缺失自动回落 Silero）",
-                       "default", False),
+    "qwen_1_5b_ct2":  ("__converted__", "Qwen2.5-1.5B-CT2（备选翻译；快，约 0.22s/句）",
+                       "quality", False),
+    "firered":        ("firered", "FireRedVAD ONNX（默认 VAD）", "default", True),
+    "hymt2":          ("hymt2", "Hy-MT2-1.8B（默认翻译引擎；需 torch）", "default", True),
     "punc_cpu":       ("punc_cpu", "接缝标点 CPU 模型（可选：省 GPU、中文 1~4ms）",
                        "quality", False),
     "fsmn_vad":       ("fsmn_vad", "FSMN-VAD（备选 VAD 引擎）", "quality", False),
@@ -57,6 +58,7 @@ def model_path(name: str) -> Path:
         "qwen_1_5b": "Qwen2.5-1.5B-Instruct-hf",
         "qwen_1_5b_ct2": "Qwen2.5-1.5B-Instruct-ct2",
         "firered": "fireredvad-onnx",
+        "hymt2": "Hy-MT2-1.8B",
         "punc_cpu": "punc-ct-transformer-zh-en-onnx",
         "fsmn_vad": "fsmn-vad-onnx",
         "qwen3_asr": "qwen3-asr-0.6b-onnx-int4",
@@ -88,8 +90,11 @@ def cmd_list():
             print("  转换：python scripts/model_manager.py convert qwen_1_5b"
                   "（需先有 qwen_1_5b 的 HF 权重）")
         if "firered" in missing:
-            print("  FireRedVAD：缺失不影响使用（自动回落 Silero）；要装见 scripts/"
-                  "export_fireredvad_onnx.py 顶部说明")
+            print("  FireRedVAD：先 scripts/download_models.py --only firered 下载权重，"
+                  "再 scripts/model_manager.py export firered 导出 ONNX"
+                  "（导出要 torch + fireredvad 包）")
+        if "hymt2" in missing:
+            print("  Hy-MT2-1.8B 约 4.1GB，下载后即用（走 transformers/PyTorch，需要 torch）")
     else:
         print("✔ 必需项齐全，直接启动即可（启动_MaiSubtitle.bat）")
 
@@ -121,6 +126,14 @@ def cmd_download(tier: str):
         subprocess.run([sys.executable,
                         str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), "1.5b"],
                        check=False)
+    # FireRedVAD：权重下好了但 ONNX 还没导出 → 自动导出（否则 VAD 用不上 FireRed）
+    if (dir_size_mb(MODELS_DIR / "fireredvad") > 1
+            and dir_size_mb(model_path("firered")) <= 0.1):
+        print("\n检测到 FireRedVAD 权重但缺 ONNX → 自动导出 …")
+        import subprocess
+        subprocess.run([sys.executable,
+                        str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")],
+                       check=False)
     cmd_list()
 
 
@@ -132,6 +145,21 @@ def cmd_convert(name: str):
         sys.exit(2)
     subprocess.run([sys.executable,
                     str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), key], check=False)
+    cmd_list()
+
+
+def cmd_export(name: str):
+    """把下载来的原始权重导出成运行时可用的 ONNX（目前只有 FireRedVAD）。"""
+    if name != "firered":
+        print(f"无可导出项: {name}（可用: firered）")
+        sys.exit(2)
+    import subprocess
+    src = MODELS_DIR / "fireredvad"
+    if dir_size_mb(src) < 1:
+        print("缺权重：先运行 python scripts/download_models.py --only firered")
+        sys.exit(2)
+    subprocess.run([sys.executable,
+                    str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")], check=False)
     cmd_list()
 
 
@@ -155,7 +183,7 @@ def cmd_size():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["list", "download", "convert", "delete", "size"])
+    ap.add_argument("cmd", choices=["list", "download", "convert", "export", "delete", "size"])
     ap.add_argument("target", nargs="?", default="all")
     a = ap.parse_args()
     if a.cmd == "list":
@@ -164,6 +192,8 @@ def main():
         cmd_download(a.target if a.target in ("all", "default", "quality") else "all")
     elif a.cmd == "convert":
         cmd_convert(a.target)
+    elif a.cmd == "export":
+        cmd_export(a.target)
     elif a.cmd == "delete":
         cmd_delete(a.target)
     elif a.cmd == "size":

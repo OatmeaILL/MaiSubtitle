@@ -73,6 +73,19 @@ MS_MODELS = {
         "repo": "iic/punc_ct-transformer_zh-cn-common-vocab272727-onnx",
         "dest": "punc-ct-transformer-zh-en-onnx",
     },
+    # FireRedVAD 的 Stream-VAD 权重（**默认 VAD 的导出源**，2.3MB，Apache-2.0）：
+    # 下载后由 scripts/export_fireredvad_onnx.py 导出成 models/fireredvad-onnx（≈2MB）
+    "firered": {
+        "repo": "FireRedTeam/FireRedVAD",
+        "dest": "fireredvad",
+    },
+    # 腾讯混元 Hy-MT2-1.8B（**默认翻译引擎 hymt2 的权重**，Apache-2.0，约 4.1GB）：
+    # 架构 HunYuanDenseV1ForCausalLM 不被 CTranslate2 支持 → 只能走 transformers/PyTorch，
+    # 所以它需要 torch（安装器会一起装）
+    "hymt2": {
+        "repo": "Tencent-Hunyuan/Hy-MT2-1.8B",
+        "dest": "Hy-MT2-1.8B",
+    },
 }
 
 # GitHub 资产（url 相对 github.com）

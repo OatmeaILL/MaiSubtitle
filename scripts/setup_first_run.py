@@ -27,29 +27,27 @@ VENV_PY = VENV / "Scripts" / "python.exe"
 REQ = ROOT / "requirements.txt"
 PIP_MIRROR = "https://mirrors.aliyun.com/pypi/simple/"
 PIP_HOST = "mirrors.aliyun.com"
-# CPU 版 torch 的国内轮子源（实测可列目录、含 cp312 win_amd64；只用于"转换翻译模型"
-# 这一次性步骤，装完可以留着也可以卸）。官方 CPU 源作回落。
-TORCH_LINKS = "https://mirrors.aliyun.com/pytorch-wheels/cpu/"
-TORCH_FALLBACK = "https://download.pytorch.org/whl/cpu"
 
 # 启动必需的关键 import（与 requirements.txt 对应；缺任何一个都进不去主界面）
 CORE_IMPORTS = [
     "PyQt6", "numpy", "av", "soundfile", "soxr", "faster_whisper", "ctranslate2",
     "onnxruntime", "kaldi_native_fbank", "pyaudiowpatch", "keyboard", "psutil",
     "requests", "zhconv", "rapidfuzz", "jinja2", "tokenizers",
+    "torch", "transformers",          # 默认翻译引擎 hymt2（PyTorch）需要
 ]
-# 必需模型（对应默认/推荐配置：whisper 识别 + Silero VAD + Qwen2.5-CT2 翻译）
+# 默认档要准备的模型：识别 + 翻译 + VAD（就是设置里的推荐值）
 MODEL_MARKS = [
     ("Whisper large-v3-turbo", "models/faster-whisper-large-v3-turbo/model.bin"),
-    ("Silero VAD", "models/silero_vad.onnx"),
-    ("翻译 Qwen2.5-1.5B-CT2", "models/Qwen2.5-1.5B-Instruct-ct2/model.bin"),
+    ("Hy-MT2-1.8B（翻译）", "models/Hy-MT2-1.8B/config.json"),
+    ("FireRedVAD ONNX", "models/fireredvad-onnx/stream_vad.onnx"),
+    ("Silero VAD（VAD 兜底）", "models/silero_vad.onnx"),
 ]
-# 转换用的 HF 权重（下完转好可以删；所以它是"过程件"不是"必需件"）
-HF_DIR = ROOT / "models" / "Qwen2.5-1.5B-Instruct-hf"
-# 可选增强（装了更准/更快，不装自动回落）：标点 CPU 模型 + FireRedVAD
-DL_OPTIONAL = ["punc_cpu"]
+# 下载项（都走 ModelScope/镜像）：whisper 识别、Hy-MT2 翻译、FireRedVAD（下完要导出 ONNX）
+DL_DEFAULT = ["whisper_turbo", "silero_vad", "firered", "hymt2"]
+# FireRedVAD 的 ONNX 由原始权重导出（要 torch + fireredvad 包，两步都在本脚本里做）
+FIRERED_ONNX = ROOT / "models" / "fireredvad-onnx" / "stream_vad.onnx"
 
-CHUNK_GB = 3.0      # 必需模型的大致体积（打印给用户看的预算）
+CHUNK_GB = 7.0      # 默认档大致体积（依赖 ~3GB 含 torch + 模型 ~4GB），打印给用户看的预算
 
 
 def say(msg: str = ""):
@@ -93,12 +91,11 @@ def pip_install(args: list, py: Path | None = None) -> int:
 
 
 def models_state() -> tuple:
-    """返回 (已有的必需模型名, 缺的必需模型名, HF 权重是否在)。"""
+    """返回 (已有的模型名, 缺的模型名)。"""
     have, miss = [], []
     for name, rel in MODEL_MARKS:
         (have if (ROOT / rel).exists() else miss).append(name)
-    hf_ok = HF_DIR.exists() and any(HF_DIR.glob("*.safetensors"))
-    return have, miss, hf_ok
+    return have, miss
 
 
 def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> bool:
@@ -140,61 +137,34 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
             say("\n[1/4] 依赖：[OK] 齐全")
 
     # ---- 2. 必需模型 ----
-    have, mmiss, hf_ok = models_state()
-    # 翻译模型是"转换产物"：HF 权重只是转换的输入。**CT2 在就不需要 HF**
-    #（否则会在"早就转好了"的机器上又要下 2.9GB —— 实测踩过）。
-    need_ct2 = "翻译 Qwen2.5-1.5B-CT2" in mmiss
-    dl = [m for m in mmiss if m != "翻译 Qwen2.5-1.5B-CT2"]
-    if need_ct2 and not hf_ok:
-        dl.append("qwen_1_5b_hf")
+    have, mmiss = models_state()
     if skip_models:
         say("\n[2/4] 模型：跳过（--skip-models）")
-    elif dl:
-        say(f"\n[2/4] 模型：缺 {'、'.join(mmiss)} → 下载 {' '.join(dl)}"
-            f"（约 {CHUNK_GB:.1f} GB）")
+    elif mmiss:
+        say(f"\n[2/4] 模型：缺 {'、'.join(mmiss)} → 下载 {' '.join(DL_DEFAULT)}（约 4GB）")
         if fix:
             if run([VENV_PY, str(ROOT / "scripts" / "download_models.py"),
-                    "--only", *dl]) != 0:
-                say("      [错误] 下载失败：见上面的报错（HF 镜像回落也在 download_models 里）")
+                    "--only", *DL_DEFAULT]) != 0:
+                say("      [错误] 下载失败：见上面的报错（镜像回落也在 download_models 里）")
                 return False
             say("      [OK] 模型下好了")
         else:
             ok = False
     else:
-        say("\n[2/4] 模型：[OK] 齐全（" + "、".join(have) + "）"
-            + ("（翻译模型待转换）" if need_ct2 else ""))
+        say("\n[2/4] 模型：[OK] 齐全（" + "、".join(have) + "）")
 
-    # ---- 3. 翻译模型转换（需要 torch，仅这一次）----
+    # ---- 3. FireRedVAD：原始权重 → ONNX（要 torch + fireredvad 包，CPU、几秒）----
     if skip_models:
-        say("\n[3/4] 翻译模型转换：跳过（--skip-models）")
-    elif not need_ct2:
-        say("\n[3/4] 翻译模型转换：[OK] 已就绪"
-            "（转换用的 HF 权重可以删：models/Qwen2.5-1.5B-Instruct-hf）")
+        say("\n[3/4] FireRedVAD 导出：跳过（--skip-models）")
+    elif FIRERED_ONNX.exists():
+        say("\n[3/4] FireRedVAD 导出：[OK] 已就绪")
     else:
-        say("\n[3/4] 翻译模型转换：需要 torch（CPU 版即可，只用于转换这一次）")
-        if not torch_ok():
-            if fix:
-                say("      装 CPU 版 torch（阿里云轮子源，约 200 MB）…")
-                if pip_install(["--find-links", TORCH_LINKS, "torch"]) != 0:
-                    say("      阿里云源失败 → 试官方 CPU 源 …")
-                    if run([VENV_PY, "-m", "pip", "install", "torch",
-                            "--index-url", TORCH_FALLBACK,
-                            "--disable-pip-version-check"]) != 0:
-                        say("      torch 装不上（不影响其它步骤；"
-                            "装好后重跑本脚本即可继续转换）")
-                        return False
-                if not torch_ok():
-                    say("       torch 装了但 import 不进来")
-                    return False
-            else:
-                say("      （--check：会先装 CPU 版 torch，再转换）")
-                ok = False
+        say("\n[3/4] FireRedVAD 导出：把权重导成 ONNX（主程序用它做分句，不需要 torch）")
         if fix:
             if run([VENV_PY, str(ROOT / "scripts" / "model_manager.py"),
-                    "convert", "qwen_1_5b"]) != 0:
-                say("      [错误] 转换失败：见上面的报错")
+                    "export", "firered"]) != 0:
+                say("      [错误] 导出失败：见上面的报错")
                 return False
-            say("      [OK] 转换完成（models/Qwen2.5-1.5B-Instruct-ct2）")
         else:
             ok = False
 
@@ -203,16 +173,16 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
     if fix or not ok:
         run([VENV_PY, str(ROOT / "scripts" / "model_manager.py"), "list"])
     if fix:
-        say("\n可选增强（不装也能跑，会自动回落）："
-            f"标点 CPU 模型 → .venv\\Scripts\\python.exe scripts/download_models.py"
-            f" --only {' '.join(DL_OPTIONAL)}")
-        say("  FireRedVAD（推荐 VAD）需要自己导出：scripts/export_fireredvad_onnx.py"
-            "（要 torch + 上游权重；缺失自动回落 Silero）")
+        say("\n其它可选模型（用不到就不用装）：")
+        say("  · 后备翻译 Qwen2.5-CT2（快，0.22s/句）：scripts/download_models.py"
+            " --only qwen_1_5b_hf，再 scripts/model_manager.py convert qwen_1_5b")
+        say("  · 标点 CPU 模型（中文补标点免 GPU）：scripts/download_models.py --only punc_cpu")
+        say("  · Qwen3-ASR 识别：scripts/download_models.py --only qwen3_asr_0_6b_onnx_int4")
 
     if not fix:
         say("\n--check 结束：以上就是要做的步骤（去掉 --check 即真执行）。")
         return False
-    _, miss_now, _ = models_state()      # 转换刚做完 → 重新判一遍，别拿旧结果下结论
+    _, miss_now = models_state()         # 刚下/导出完 → 重新判一遍，别拿旧结果下结论
     if miss_now:
         say("\n[注意] 还缺：" + "、".join(miss_now))
         return False
