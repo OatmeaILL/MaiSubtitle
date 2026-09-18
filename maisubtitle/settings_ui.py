@@ -9,9 +9,11 @@
   - **重启提示**：改到需要重启的项，保存后由主程序弹窗询问是否立即重启。
 """
 import os
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QComboBox, QSpinBox, QSlider,
@@ -89,6 +91,69 @@ def _row(form, text, widget):
     return label, widget
 
 
+# ---- 「下载缺失的模型」：弹独立 cmd 窗口跑（与 安装_首次使用.bat 同款）----
+# 模块级：设置窗口关掉再打开也要能看到"已经在下载"，避免起第二个进程抢同一个文件。
+_DL_PROC = None
+
+
+def _dl_running() -> bool:
+    """是否有下载窗口正在跑。"""
+    return _DL_PROC is not None and _DL_PROC.poll() is None
+
+
+def _spawn_download_window(names: list) -> "subprocess.Popen | None":
+    """新开一个命令窗口跑 `model_manager.py download <名字…>`（看得见进度与报错）。
+
+    为什么不用管道捕获输出（2026-09-18 用户实报后改）：tqdm 的进度条是 `\\r` 刷新的
+    整行，捕获后只能显示截断的一小截；而且设置窗口一关就完全没界面了。改成新控制台后，
+    进度、镜像回落、报错都摆在用户面前 —— 与 安装_首次使用.bat 的体验一致。
+    bat 按项目硬约束落成 **GBK + CRLF**，并带 `PYTHONIOENCODING=gbk:replace`
+    （见 HANDOVER §五：脚本往控制台打印不能用 ✔/⚠ 这类 GBK 编不出的字符）。
+    返回 None 表示已有一个在跑（不重复启动）。
+    """
+    global _DL_PROC
+    if _dl_running():
+        return None
+    py = Path(sys.executable)
+    if py.name.lower() == "pythonw.exe":        # pythonw 没有控制台，换 python.exe
+        py = py.with_name("python.exe")
+    if not py.exists():
+        py = Path(sys.executable)
+    bat = Path(os.environ.get("TEMP", ".")) / f"maisub_dl_{os.getpid()}.bat"
+    lines = [
+        "@echo off",
+        "chcp 936 >nul",
+        f'cd /d "{PROJECT_ROOT}"',
+        "title MaiSubtitle 模型下载",
+        "set PYTHONIOENCODING=gbk:replace",
+        f'"{py}" "scripts\\model_manager.py" download {" ".join(names)}',
+        "echo.",
+        "if errorlevel 1 goto fail",
+        "echo [完成] 模型已下好：回到 MaiSubtitle 重启一次即生效。",
+        "goto end",
+        ":fail",
+        "echo [未完成] 上面就是原因；直接重跑一次即可（支持断点续传）。",
+        ":end",
+        "echo.",
+        "pause",
+    ]
+    try:
+        bat.write_bytes(("\r\n".join(lines) + "\r\n").encode("gbk", "replace"))
+        flags = 0x00000010 if os.name == "nt" else 0     # CREATE_NEW_CONSOLE
+        _DL_PROC = subprocess.Popen(["cmd.exe", "/c", str(bat)],
+                                    cwd=str(PROJECT_ROOT), creationflags=flags)
+        return _DL_PROC
+    except Exception as e:
+        try:
+            with open(PROJECT_ROOT / "logs" / "error.log", "a", encoding="utf-8") as f:
+                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动下载窗口失败: "
+                        f"{type(e).__name__}: {e}\n")
+        except Exception:
+            pass
+        _DL_PROC = None
+        return None
+
+
 class SettingsDialog(QDialog):
     def __init__(self, cfg, overlay, screen_count: int, parent=None,
                  cli_overrides: dict | None = None):
@@ -117,12 +182,15 @@ class SettingsDialog(QDialog):
         self.lb_models.setToolTip("按界面上当前的选择实时刷新；缺模型时启动日志与托盘也会提示；"
                                   "补救：scripts/model_manager.py list")
         lay.addWidget(self.lb_models)
-        # 「下载缺失模型」：选到本机没有的模型时出现，点一下就地补下（2026-09-18）。
-        # 下载跑在子进程里（不进 UI 线程），进度只写 dict、由主线程轮询上屏 ——
-        # 跨线程碰 Qt 会随机卡死；对话框随时可能被关掉，所以也不往它发信号。
+        # 「下载缺失模型」：选到本机没有的模型时出现，点一下补下（2026-09-18）。
+        # 下载**弹一个独立的 cmd 窗口**跑（与 安装_首次使用.bat 同款：新控制台 + GBK
+        # 输出 + 跑完 pause），进度/报错用户都看得见、窗口关掉也不影响下载。
+        # 曾经的做法是管道捕获子进程输出再截一行显示 —— 进度条是 \r 刷新的整行，
+        # 截出来等于没有；设置窗口一关就完全没界面（用户实报，已改）。
         self.btn_dl = QPushButton("下载缺失的模型")
         self.btn_dl.setToolTip("把「模型状态」里标 ✘ 的那几项下齐（走 ModelScope/HF 镜像，"
-                               "可断点续传；FireRedVAD / Qwen 会自动做导出/转换）")
+                               "可断点续传；FireRedVAD / Qwen 会自动做导出/转换）\n"
+                               "会弹出一个命令窗口显示实时进度")
         self.btn_dl.clicked.connect(self._download_missing)
         self.btn_dl.hide()
         self.lb_dl = QLabel("")
@@ -132,9 +200,8 @@ class SettingsDialog(QDialog):
         row_dl.addWidget(self.btn_dl)
         row_dl.addWidget(self.lb_dl, 1)
         lay.addLayout(row_dl)
-        self._dl = {"running": False, "done": False, "rc": None, "tail": []}
         self._dl_timer = QTimer(self)
-        self._dl_timer.setInterval(600)
+        self._dl_timer.setInterval(1000)
         self._dl_timer.timeout.connect(self._dl_poll)
         # 换引擎 / 换 VAD → 状态行立刻跟着变（不用先保存）
         self.cmb_engine.currentIndexChanged.connect(self._refresh_models)
@@ -702,7 +769,7 @@ class SettingsDialog(QDialog):
 
     def _refresh_models(self, *_a):
         """按**界面上当前选的值**刷新模型状态行（不必先保存；换引擎/换 VAD 会触发）。"""
-        if not hasattr(self, "_dl"):
+        if not hasattr(self, "_dl_timer"):
             return                       # 构造过程中信号先到、状态行/下载行还没建好
         from . import selfcheck
         kw = self._model_kw()
@@ -710,98 +777,70 @@ class SettingsDialog(QDialog):
         missing = selfcheck.missing_downloads(self.cfg, **kw)
         self.lb_models.setStyleSheet(
             "color: #4a8a4a;" if not missing else "color: #c05a2a;")
-        # 选到的模型没装 → 亮出「下载」按钮（说明写清是哪些、多大）
-        if self._dl["running"]:
-            return                       # 下载中：按钮状态由 _dl_poll 管
+        if _dl_running():
+            # 下载中（可能是别的设置窗口启动的）：禁用按钮 + 说清在哪儿看进度，
+            # 否则用户会再点一次 → 两个进程抢同一个文件
+            self.btn_dl.setVisible(True)
+            self.btn_dl.setEnabled(False)
+            self.btn_dl.setText("正在下载…")
+            self.lb_dl.setVisible(True)
+            self.lb_dl.setText("模型正在独立的命令窗口里下载，进度与报错都在那个窗口里看。\n"
+                               "下完后关掉那个窗口，这里会自动刷新；重启程序即生效。")
+            self.lb_dl.setStyleSheet("color: #d08a2a;")
+            if not self._dl_timer.isActive():
+                self._dl_timer.start()       # 关掉再打开的窗口也能盯到结束
+            return
+        self.btn_dl.setEnabled(True)
         self.btn_dl.setVisible(bool(missing))
         if missing:
             self.btn_dl.setText(f"下载缺失的模型（{len(missing)} 项）")
-            self.btn_dl.setToolTip("\n".join("· " + d for _, d in missing))
+            self.btn_dl.setToolTip("会弹出一个命令窗口显示实时进度：\n"
+                                   + "\n".join("· " + d for _, d in missing))
 
     def _download_missing(self):
-        """把界面上选中但缺失的模型就地补下（子进程 + 主线程轮询进度）。"""
+        """弹独立命令窗口补下缺失模型（与 安装_首次使用.bat 同一套做法）。"""
         from . import selfcheck
         missing = selfcheck.missing_downloads(self.cfg, **self._model_kw())
         if not missing:
             return
+        if _dl_running():
+            return                       # 已有一个在跑，不重复启动
         desc = "\n".join("· " + d for _, d in missing)
         ans = QMessageBox.question(
             self, "下载缺失的模型",
             f"本机还没有这些模型：\n\n{desc}\n\n"
-            "现在下载吗？走 ModelScope / HF 镜像，可断点续传；"
-            "FireRedVAD 与 Qwen 会在下完后自动导出 / 转换。\n"
+            "现在下载吗？会弹出一个命令窗口显示实时进度（走 ModelScope / HF 镜像，"
+            "可断点续传；FireRedVAD 与 Qwen 会在下完后自动导出 / 转换）。\n"
             "下载期间程序照常用；下完重启一次即生效。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes)
         if ans != QMessageBox.StandardButton.Yes:
             return
-        names = [n for n, _ in missing]
-        self._dl.update(running=True, done=False, rc=None, tail=[])
-        self.btn_dl.setEnabled(False)
-        self.btn_dl.setText("下载中…")
-        self.lb_dl.setVisible(True)
-        self.lb_dl.setText("正在启动下载…（窗口可以关掉，下载会继续）")
-        self.lb_dl.setStyleSheet("color: #d08a2a;")
+        if _spawn_download_window([n for n, _ in missing]) is None:
+            self.lb_dl.setVisible(True)
+            self.lb_dl.setText("启动下载窗口失败：详见 logs/error.log；"
+                               "也可以手动跑 安装_首次使用.bat --check 看缺什么。")
+            self.lb_dl.setStyleSheet("color: #c05a2a;")
+            return
+        self._refresh_models()
         self._dl_timer.start()
 
-        cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "model_manager.py"),
-               "download", *names]
-        try:
-            import subprocess
-            # 合并 stderr：下载脚本的进度条/警告都走 stderr，分开读会看不到
-            flags = 0x08000000 if os.name == "nt" else 0     # CREATE_NO_WINDOW
-            p = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                                 errors="replace", creationflags=flags)
-        except Exception as e:
-            self._dl.update(running=False, done=True, rc=-1)
-            self.lb_dl.setText(f"启动下载失败：{type(e).__name__}: {e}")
-            self.lb_dl.setStyleSheet("color: #c05a2a;")
-            self.btn_dl.setEnabled(True)
-            self._dl_timer.stop()
-            return
-
-        def _reader(proc):
-            # 只写 dict，不碰 Qt（对话框随时可能被关掉/销毁）
-            try:
-                for line in proc.stdout:
-                    self._dl["tail"].append(line.rstrip())
-                    del self._dl["tail"][:-6]        # 只留最后几行做进度显示
-            except Exception:
-                pass
-            try:
-                self._dl["rc"] = proc.wait()
-            except Exception:
-                self._dl["rc"] = -1
-            self._dl["running"] = False
-            self._dl["done"] = True
-
-        threading.Thread(target=_reader, args=(p,), daemon=True,
-                         name="model-download").start()
-
     def _dl_poll(self):
-        """主线程轮询下载进度（子进程输出 → 状态标签）。"""
-        st = self._dl
-        if not st["running"] and not st["done"]:
-            self._dl_timer.stop()
+        """轮询下载窗口是否结束（进度本身在命令窗口里看）。结束后刷新模型状态。"""
+        if _dl_running():
             return
-        tail = st["tail"][-1] if st["tail"] else ""
-        if st["running"]:
-            self.lb_dl.setText("下载中…（可关掉本窗口，下载会继续）\n" + tail[-160:])
-            return
-        # 结束：rc==0 且没有项目再缺失才算成功
         self._dl_timer.stop()
-        self.btn_dl.setEnabled(True)
+        self._refresh_models()
         from . import selfcheck
         left = selfcheck.missing_downloads(self.cfg, **self._model_kw())
-        if st["rc"] == 0 and not left:
-            self.lb_dl.setText("✔ 下载完成 —— 重启程序后生效")
+        self.lb_dl.setVisible(True)
+        if not left:
+            self.lb_dl.setText("✔ 模型已下载齐 —— 重启程序后生效")
             self.lb_dl.setStyleSheet("color: #4a8a4a;")
         else:
-            self.lb_dl.setText(f"下载结束（退出码 {st['rc']}），仍有 {len(left)} 项缺失："
-                               "重跑一次可断点续传，或看 logs/ 里的输出\n" + tail[-160:])
+            self.lb_dl.setText(f"下载窗口已结束，但仍缺 {len(left)} 项："
+                               "看那个窗口里的报错；重跑一次可断点续传")
             self.lb_dl.setStyleSheet("color: #c05a2a;")
-        self._refresh_models()
 
     def _sync_vad(self):
         fr = self.cmb_vad.currentText() == "firered"
