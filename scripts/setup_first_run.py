@@ -168,15 +168,56 @@ def has_nvidia_gpu() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
-def cuda_index_reachable(seconds: int = 8) -> bool:
-    """官方 CUDA 索引通不通。不通就跳过 CUDA torch —— 绝不能因此让安装失败。"""
-    try:
-        req = urllib.request.Request(TORCH_CUDA_INDEX + "/torch/",
-                                     headers={"User-Agent": "MaiSubtitle-setup"})
-        with urllib.request.urlopen(req, timeout=seconds) as r:
-            return r.status == 200
-    except Exception:
+def cuda_index_reachable(seconds: int = 8, tries: int = 3) -> bool:
+    """官方 CUDA 索引通不通。不通就跳过 CUDA torch —— 绝不能因此让安装失败。
+
+    官方源国内直连**时好时坏**（Fastly CDN）：2026-09-18 晚用户实装时 8s 探活失败 →
+    静默跳过 → 装了 CPU 版 torch → hymt2 降级 CPU（"老问题又出现了"）。所以加重试：
+    3 次 × 8s，间隔 2s —— 抖动一下也能等到。还不通就是真不通（此刻下载也必失败），
+    放心走 CPU 版，另给 `安装_首次使用.bat --cuda-torch` 随时补装。
+    """
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(TORCH_CUDA_INDEX + "/torch/",
+                                         headers={"User-Agent": "MaiSubtitle-setup"})
+            with urllib.request.urlopen(req, timeout=seconds) as r:
+                if r.status == 200:
+                    if i:
+                        print(f"      官方 CUDA 源第 {i + 1} 次探活成功")
+                    return True
+        except Exception:
+            pass
+        if i < tries - 1:
+            time.sleep(2)
+    return False
+
+
+def install_cuda_torch() -> bool:
+    """补装/换装 CUDA 版 torch（`安装_首次使用.bat --cuda-torch`）。
+
+    场景：首次安装时官方源恰好不可达 → 装了 CPU 版 torch（hymt2 降级 CPU）。
+    官方源国内时好时坏，所以给一条**随时能重跑**的命令：网络通了跑一下，
+    pip 会卸掉 CPU 版再装 CUDA 版（--no-deps 不动 sympy，避开卸载卡死的坑）。
+    """
+    if not has_nvidia_gpu():
+        say("[注意] 本机没有 NVIDIA 显卡，不需要 CUDA 版 torch；hymt2 会跑 CPU，"
+            "想更快就把翻译引擎换成 qwen（设置 → 翻译引擎）")
         return False
+    if not cuda_index_reachable():
+        say("[错误] 官方 CUDA 源（download.pytorch.org）此刻连不上（重试 3 次均失败）。"
+            "过一会儿网络好了再跑一次本命令即可。")
+        return False
+    if torch_has_cuda():
+        say("[OK] torch 已带 CUDA，无需补装")
+        return True
+    say(f"开始装 {TORCH_CUDA_SPEC}（约 2.4GB，实测 3~5 分钟）…")
+    rc = pip_install([TORCH_CUDA_SPEC], index_url=TORCH_CUDA_INDEX, no_deps=True)
+    if rc != 0 or not torch_has_cuda():
+        say("[错误] CUDA 版 torch 没装上（看上面的报错）；"
+            "网络恢复后重跑：安装_首次使用.bat --cuda-torch")
+        return False
+    say("[OK] torch 带 CUDA ✓（hymt2 翻译走 GPU）")
+    return True
 
 
 def reqs_without_torch() -> Path:
@@ -426,10 +467,13 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
                 say("             本机没有 NVIDIA 显卡（nvidia-smi），这样是正常的；"
                     "想更快可换引擎：设置 → 翻译引擎 → qwen（CT2，约 0.22s/句）")
             else:
-                say("             原因：官方源当时不可达，或 CUDA 版没装上。两条替代：")
-                say("               ① 设置 → 外部 torch 目录：指一个已有的 CUDA torch，"
+                say("             原因：官方源当时不可达（国内对它时好时坏），或 CUDA 版没装上。"
+                    "三条替代：")
+                say("               ① 随时补装：安装_首次使用.bat --cuda-torch"
+                    "（官方源通了再跑，2.4GB，装完重启程序生效）")
+                say("               ② 设置 → 外部 torch 目录：指一个已有的 CUDA torch，"
                     "零下载（机器上别的 AI 环境里有就行）")
-                say("               ② 设置 → 翻译引擎 → qwen（CT2，约 0.22s/句）")
+                say("               ③ 设置 → 翻译引擎 → qwen（CT2，约 0.22s/句）")
 
     # ---- 2. 两个必须 --no-deps 单独装的包（见文件头 ②）----
     if skip_deps:
@@ -525,11 +569,17 @@ def main() -> int:
     ap.add_argument("--mirror", default="", metavar="源",
                     help="强制 PyPI 源（清华 / 中科大 / 腾讯云 / 阿里云，或完整 index URL）；"
                          "默认自动测速选最快")
+    ap.add_argument("--cuda-torch", action="store_true",
+                    help="只补装 CUDA 版 torch（给 torch 不带 CUDA 的已装环境；"
+                         "官方源国内时好时坏，网络通了跑一次即可）")
     a = ap.parse_args()
 
     global FORCED_MIRROR
     if a.mirror:
         FORCED_MIRROR = a.mirror
+
+    if a.cuda_torch:
+        return 0 if install_cuda_torch() else 1
 
     if a.check:
         report(fix=False)
