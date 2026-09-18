@@ -17,6 +17,9 @@ class GlossaryEditor(QDialog):
         self.setWindowTitle(f"术语库管理 — {path}")
         self.resize(860, 560)
         self.g = Glossary(path)
+        # 用户**真的点过保存**置 True：调用方据此把"这个术语库"写进配置（= 自己设置过）。
+        # 只打开看一眼就关掉不算 —— 否则按一次 F8 就等于启用了术语库（2026-09-18 修）。
+        self.saved = False
         self._build_ui()
         self._reload_table()
 
@@ -111,6 +114,7 @@ class GlossaryEditor(QDialog):
     def _save(self):
         self.g.terms = self._from_table()
         self.g.save()          # 写文件 → 管线靠 mtime 热更新自动生效
+        self.saved = True
         self._reload_table()
         QMessageBox.information(self, "已保存",
                                 f"{len(self.g.terms)} 条术语已写入，识别/翻译管线实时生效。")

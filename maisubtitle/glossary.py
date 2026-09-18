@@ -118,7 +118,15 @@ class Glossary:
         self._mtime = self.path.stat().st_mtime
 
     def check_reload(self) -> bool:
-        m = self.path.stat().st_mtime
+        try:
+            m = self.path.stat().st_mtime
+        except OSError:
+            # 文件被删了 / 还没建（配置里填了路径但文件不在）→ 当成空表。
+            # 不接住的话每次 match()/fix_asr() 都会抛 FileNotFoundError。
+            if self._mtime:
+                self.load()            # load() 遇到不存在的文件会清空并置 _mtime=0
+                return True
+            return False
         if m != self._mtime:
             self.load()
             return True

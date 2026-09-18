@@ -237,14 +237,16 @@ class AppConfig:
     # ---- asr_backend="ws"：火山引擎「大模型流式语音识别」（WebSocket 双向流式）----
     # 端点：bigmodel_async=双向流式优化版（推荐，支持二遍识别）；
     #      bigmodel=双向流式；bigmodel_nostream=流式输入（15s 后或负包才返回，更准更慢）
-    asr_ws_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+    # 默认值是开发机实测通过的一套（豆包流式识别 2.0 的 plan 端点 + seedasr 资源），
+    # 新用户填上 API Key 即可用；换了服务版本要按控制台改回对应端点/资源 ID。
+    asr_ws_url: str = "wss://openspeech.bytedance.com/api/v3/plan/sauc/bigmodel_nostream"
     asr_ws_model_name: str = "bigmodel"      # 请求体里的 model_name（文档：目前只有 bigmodel）
     asr_ws_api_key: str = ""                 # 新版控制台：X-Api-Key（只填它就够）
     asr_ws_app_key: str = ""                 # 旧版控制台：X-Api-App-Key（APP ID）
     asr_ws_access_key: str = ""              # 旧版控制台：X-Api-Access-Key（Access Token）
     # 资源 ID：豆包流式识别 1.0 = volc.bigasr.sauc.duration（小时版）/
     #         .concurrent（并发版）；2.0 = volc.seedasr.sauc.*
-    asr_ws_resource_id: str = "volc.bigasr.sauc.duration"
+    asr_ws_resource_id: str = "volc.seedasr.sauc.duration"
     # 延迟
     loop_tick_ms: int = 100             # 实时循环节拍：越小字幕出得越快（250→100 中位快 82ms）
     progressive_display: bool = True    # 识别一出先显示原文，译文好了再补（仅双语模式）
@@ -311,8 +313,9 @@ class AppConfig:
     # FireRedVAD：句间静音超过这么久才断句（帧 10ms）。500 = 低延迟预设
     firered_min_silence_ms: float = 500.0
     # 单句上限：连续说话（播客/解说）没有停顿时靠它强制断句。
-    # **体感延迟 ≈ 段长 + 0.7s**，所以默认取 4s（低延迟预设）；放宽到 7~9s 会明显变慢
-    firered_max_speech_s: float = 4.0
+    # **体感延迟 ≈ 段长 + 0.7s**，所以它是最直接的旋钮：4s 是低延迟档（设置里
+    # 「低延迟预设」会设成 4），7s 是默认档 —— 句子更完整、但要多等 3 秒左右。
+    firered_max_speech_s: float = 7.0
     # 音频断流（暂停/结束）多久后把"最后一句"立刻定稿，ms。
     # 不加它：最后一句要等下一段音频才出现（字幕落后一句、不连贯）
     idle_flush_ms: float = 2500.0
@@ -322,7 +325,10 @@ class AppConfig:
     source_language: str = "auto"
     split_long_chars: int = 60          # 识别文本超过这么多字且含句末标点 → 按标点再分句
     # 术语（**你自己的数据，不进 git**；仓库里给的是 glossary.example.csv 样例）
-    glossary_path: str = "glossary.csv"     # 空 = 不启用；相对路径按项目根解析
+    # **默认不启用**（空）：术语会进识别提示词与翻译术语保护，配错了会让模型"无中生有"
+    # （整表喂识别侧就是老坑）。只有用户在设置里填了路径、或按 F8 在编辑器里保存过，
+    # 才算"自己设置"，此前一律不读。相对路径按项目根解析。
+    glossary_path: str = ""
     # 识别/翻译放进子进程（2026-09-16）：原生 GPU 调用卡死时只重启子进程，
     # 悬浮窗/采集/VAD 不受影响（详见 maisubtitle/gpu_proc.py）。
     gpu_subprocess: bool = True

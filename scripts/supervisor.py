@@ -15,7 +15,7 @@
 调试用环境变量：MAISUB_SUP_STALE（默认 25 秒）、MAISUB_SUP_GRACE（首次心跳等待，默认 180 秒）、
               MAISUB_SUP_PY / MAISUB_SUP_APP（换解释器 / 换脚本：排障自测用）、
               MAISUB_SUP_FAST_EXIT / MAISUB_SUP_FAST_MAX（秒退阈值与次数，见下）、
-              MAISUB_NO_POPUP=1（不弹系统弹窗：自动化测试用）
+              MAISUB_NO_POPUP=1（不发右下角通知：自动化测试用）
 """
 import os
 import subprocess
@@ -71,21 +71,54 @@ def _child_output():
         return None
 
 
-def _popup(title: str, text: str):
-    """pythonw 没有控制台 → 用系统弹窗把话说给用户听（ctypes 是标准库）。
-    MAISUB_NO_POPUP=1 关掉（自动化测试不能卡在等点击上）。"""
+def _toast(title: str, text: str) -> bool:
+    """右下角系统通知（不依赖 Qt / 不弹对话框）。失败返回 False（调用方已写日志）。
+
+    2026-09-18 用户要求："报错不要弹提示框，只保留右下角 Windows 提醒"。守护进程里
+    没有 Qt，所以走 PowerShell 调 WinRT 的 ToastNotificationManager（Win10/11 自带）；
+    AppId 借用 PowerShell 自己的（未注册的 AppId 会被系统拒收）。
+    MAISUB_NO_POPUP=1 时跳过（自动化测试用）。
+    """
     if os.environ.get("MAISUB_NO_POPUP"):
-        return
+        return False
     try:
-        import ctypes
-        # MB_OK | MB_ICONERROR | MB_SETFOREGROUND
-        ctypes.windll.user32.MessageBoxW(None, text, title, 0x00000000 | 0x10 | 0x10000)
+        from xml.sax.saxutils import escape
+        xml = ('<toast duration="long"><visual><binding template="ToastGeneric">'
+               f"<text>{escape(title)}</text><text>{escape(text[:600])}</text>"
+               "</binding></visual></toast>")
+        env = dict(os.environ, MAISUB_TOAST_XML=xml)
+        ps = (
+            "$ErrorActionPreference='Stop';"
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications,"
+            " ContentType=WindowsRuntime] > $null;"
+            "[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications,"
+            " ContentType=WindowsRuntime] > $null;"
+            "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument,"
+            " ContentType=WindowsRuntime] > $null;"
+            "$x = New-Object Windows.Data.Xml.Dom.XmlDocument;"
+            "$x.LoadXml($env:MAISUB_TOAST_XML);"
+            "$t = [Windows.UI.Notifications.ToastNotification]::new($x);"
+            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+            "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'"
+            ").Show($t);"
+        )
+        flags = 0x08000000                       # CREATE_NO_WINDOW（别闪黑框）
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-WindowStyle", "Hidden", "-Command", ps],
+                           env=env, capture_output=True, timeout=20,
+                           creationflags=flags if os.name == "nt" else 0)
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()[:200]
+            log(f"（右下角通知发送失败：{err}）")
+            return False
+        return True
     except Exception as e:
-        log(f"（弹窗失败：{type(e).__name__}: {e}）")
+        log(f"（右下角通知发送失败：{type(e).__name__}: {e}）")
+        return False
 
 
 def _bail(reason: str):
-    """连续秒退 → 不再无限重启：写日志 + 弹窗，把"缺什么、下一步做什么"说清楚。"""
+    """连续秒退 → 不再无限重启：写日志 + 右下角通知，把"缺什么、下一步做什么"说清楚。"""
     tail = ""
     try:
         lines = START_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -100,7 +133,7 @@ def _bail(reason: str):
             "  3. 日志：logs\\live_demo_startup.log、logs\\supervisor.log\n")
     if tail:
         body += f"\n启动输出（最后几行）：\n{tail}\n"
-    _popup("MaiSubtitle 启动失败", body)
+    _toast("MaiSubtitle 启动失败", body)
 
 
 def main():

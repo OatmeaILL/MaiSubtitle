@@ -369,8 +369,12 @@ def apply_targets():
         _open_settings()
     if actions["editor"]:
         actions["editor"] = False
+        # 术语库路径：没设置过时默认编辑项目根的 glossary.csv，但**不写回配置** ——
+        # "打开看一眼"不等于"启用了术语库"（2026-09-18 修：以前在这里就把
+        # cfg.glossary_path 设上，按一次 F8 术语库就永久生效了）。只有用户在编辑器里
+        # 真的点过保存，才算自己设置了这个术语库。
+        was_default = not cfg.glossary_path
         gp = cfg.glossary_path or str(PROJECT_ROOT / "glossary.csv")
-        cfg.glossary_path = gp
         was_paused = targets["paused"]
         targets["paused"] = True          # 编辑期间暂停出字幕
         apply_targets()
@@ -380,7 +384,14 @@ def apply_targets():
         dlg = GlossaryEditor(gp, parent=None)
         dlg.exec()
         targets["paused"] = was_paused
-        print("术语库编辑完成，已实时生效:", gp)
+        if getattr(dlg, "saved", False):
+            if was_default:
+                cfg.glossary_path = gp      # 首次启用：随退出保存写进 config.json
+            print("术语库编辑完成，已实时生效:", gp)
+            tray.notify(f"术语库已保存：{len(dlg.g.terms)} 条\n{Path(gp).name}"
+                        + ("（重启后生效）" if was_default else "（已实时生效）"))
+        else:
+            print("术语库编辑已关闭（未保存）", gp)
 
 
 _settings_dlg = None            # 持有引用：show() 非阻塞，不能被 Python GC 掉
@@ -490,20 +501,13 @@ def _restart_app():
     app.exit(0)
 
 
-# ---- 异常上屏：warn/error 一律托盘气泡，关键的再弹一个非模态窗口 ----
-# 为什么要弹窗：GPU 子进程的 warn 以前只进日志，用户在界面上完全看不到
+# ---- 异常上屏：warn/error 一律走**右下角通知（托盘气泡）**，不再弹对话框 ----
+# 为什么要上屏：GPU 子进程的 warn 以前只进日志，用户在界面上完全看不到
 #（实测：新装环境"翻译引擎全部不可用 → 只出原文"，界面毫无提示，只能翻 logs/）。
+# 2026-09-18 用户要求去掉弹窗：报错不再打断操作（以前每条 warn/error 弹一个非模态窗，
+# 看视频时得手动关掉）。完整信息仍落 logs/error.log，气泡只显示前两行。
 _alerted: set = set()          # 同一句话只提示一次（子进程重启循环会重复报同一条）
-_alert_boxes: list = []        # 非模态窗口要留住引用，否则会被 GC 掉
 
-# **默认所有 warn/error 都弹窗** —— 用户不看日志，异常就得在前台说清楚。
-# 只有下面这几条是"会反复出现、且不需要用户立刻处理"的，降级成只发托盘气泡。
-ALERT_QUIET_ONLY = (
-    "音乐段过滤",        # 放带 BGM 的视频会频繁触发
-    "译文回退",          # 单句译文没出来，偶发
-    "UI 应用滞后",       # 性能提示
-    "不做语种检测",      # 建议性提示（固定源语言）
-)
 # 给最常见的两种问题配一句"人话 + 怎么办"，其余原样展示
 ALERT_FRIENDLY = (
     ("翻译引擎全部不可用",
@@ -511,31 +515,31 @@ ALERT_FRIENDLY = (
      "最常见的原因：本机 torch 是 CPU 版（没吃上显卡）。"
      "可在 设置 → 翻译引擎 换成 qwen，或按 README 装 CUDA 版 torch；"
      "也可以在 设置 里指定一个已有的 CUDA torch 目录。"),
-    ("缺模型", "有模型没下载齐。跑一次 安装_首次使用.bat --check 会列出缺什么和对应命令。"),
+    ("缺模型", "有模型没下载齐。设置窗口底部有「下载缺失的模型」按钮，"
+              "或跑 安装_首次使用.bat --check 看缺什么。"),
 )
 
 
-def popup_native(title: str, text: str):
-    """系统弹窗（ctypes，标准库）——**不依赖 Qt**，所以 Qt 崩了/主线程将死时也能弹。
+def notify_bg(text: str):
+    """把一条消息送到右下角通知（**可从任意线程调**）：经 ui_queue 回主线程。
 
-    跟守护进程 supervisor._popup 同一套写法：pythonw 没有控制台，只能这样把话说给用户。
-    MAISUB_NO_POPUP=1 关掉（自动化测试不能被弹窗卡住）。
+    主线程已死/Qt 不可用时退回直接 tray.notify，再失败就只留日志 —— 无论如何
+    **不再弹系统对话框**（2026-09-18 用户要求：只保留右下角提醒）。
     """
-    if os.environ.get("MAISUB_NO_POPUP"):
-        return
     try:
-        import ctypes
-        # MB_OK | MB_ICONWARNING | MB_SETFOREGROUND
-        ctypes.windll.user32.MessageBoxW(None, text[:900], title, 0x0 | 0x30 | 0x10000)
+        ui_queue.put_nowait(("__alert__", text, ""))
     except Exception:
-        pass
+        try:
+            tray.notify(text.splitlines()[0][:200], 8000)
+        except Exception:
+            pass
 
 
 def alert_user(text: str):
-    """主线程里把一条 warn/error 推到前台：托盘气泡 + 弹窗。
+    """主线程里把一条 warn/error 推到前台：托盘气泡（右下角通知）。
 
-    **只在主线程调用**（drain 里）。弹窗用 show() 不用 exec()：exec() 期间 Qt 定时器
-    停摆，悬浮窗会冻住（项目里踩过这个坑）。
+    **只在主线程调用**（drain 里）。不再弹窗：`QMessageBox.exec()` 会冻住悬浮窗，
+    而非模态窗也会挡视线/需手动关闭 —— 用户明确要求只看右下角提醒。
     """
     key = text.strip()[:110]
     if key in _alerted:
@@ -547,21 +551,11 @@ def alert_user(text: str):
             body = friendly + "\n\n（原始信息：" + text.strip()[:160] + "）"
             break
     try:
-        tray.notify(body.split("\n")[0][:200], 8000)
+        # 通知有字数上限：只取前两行有内容的行，否则会被截成半句
+        lines = [ln for ln in body.splitlines() if ln.strip()][:2]
+        tray.notify("\n".join(lines)[:240], 8000)
     except Exception:
         pass
-    if any(k in text for k in ALERT_QUIET_ONLY):
-        return
-    try:
-        box = QMessageBox()
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("MaiSubtitle 提示")
-        box.setText(body[:600])
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.show()
-        _alert_boxes.append(box)
-    except Exception:
-        popup_native("MaiSubtitle 提示", body)
 
 
 def drain():
@@ -858,12 +852,10 @@ def _thread_excepthook(args):
             _tb.print_exception(args.exc_type, args.exc_value, args.exc_traceback, file=f)
     except Exception:
         pass
-    # 线程里未捕获的异常以前只进日志 —— 用系统弹窗说给用户听（不依赖 Qt，
-    # 因为出错的可能就是 Qt 相关线程）
+    # 线程里未捕获的异常以前只进日志 —— 说给用户听：右下角通知（不再弹系统框）
     try:
         _one = "".join(_tb.format_exception_only(args.exc_type, args.exc_value)).strip()
-        popup_native("MaiSubtitle 出错了（后台线程）",
-                     f"{args.thread.name}:\n{_one}\n\n详情见 logs/error.log")
+        notify_bg(f"后台线程出错（{args.thread.name}）：{_one}\n详情见 logs/error.log")
     except Exception:
         pass
 
@@ -877,10 +869,11 @@ def _excepthook(tp, val, tb):
     with open(LOGS_DIR / "error.log", "a", encoding="utf-8") as f:
         f.write("\n[" + str(datetime.now()) + "]\n")
         _tb.print_exception(tp, val, tb, file=f)
-    # 未捕获异常必须让用户看见（以前只有日志 → 表现为"莫名其妙闪退/没反应"）
+    # 未捕获异常必须让用户看见（以前只有日志 → 表现为"莫名其妙闪退/没反应"）：
+    # 走右下角通知；Qt 已不可用时就只剩日志了（2026-09-18 起不再弹系统框）
     try:
         _one = "".join(_tb.format_exception_only(tp, val)).strip()
-        popup_native("MaiSubtitle 出错了", f"{_one}\n\n详情见 logs/error.log")
+        notify_bg(f"MaiSubtitle 出错了：{_one}\n详情见 logs/error.log")
     except Exception:
         pass
 
@@ -893,7 +886,7 @@ _model_issues = selfcheck.check(cfg)
 for _m in _model_issues:
     print("|-- 模型自检: " + _m)
 if _model_issues:
-    # 缺模型→托盘气泡**并且弹窗**：这是"用户必须去做点什么"的情况，不能只发个气泡
+    # 缺模型 → 右下角通知（说清缺什么；设置窗口底部有「下载缺失的模型」按钮）
     alert_user("模型自检发现问题：\n" + "\n".join(_model_issues[:3]) +
                ("\n…还有 %d 条" % (len(_model_issues) - 3) if len(_model_issues) > 3 else ""))
 else:

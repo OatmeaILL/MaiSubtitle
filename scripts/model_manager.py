@@ -32,11 +32,13 @@ CATALOG = {
                        "quality", False),
     "firered":        ("firered", "FireRedVAD ONNX（默认 VAD）", "default", True),
     "hymt2":          ("hymt2", "Hy-MT2-1.8B（默认翻译引擎；需 torch）", "default", True),
-    "punc_cpu":       ("punc_cpu", "接缝标点 CPU 模型（可选：省 GPU、中文 1~4ms）",
-                       "quality", False),
+    "punc_cpu":       ("punc_cpu", "接缝标点 CPU 模型（中文补标点 1~4ms、不占 GPU）",
+                       "default", False),
     "fsmn_vad":       ("fsmn_vad", "FSMN-VAD（备选 VAD 引擎）", "quality", False),
     "qwen3_asr":      ("qwen3_asr_0_6b_onnx_int4",
                        "Qwen3-ASR-0.6B ONNX（备选识别后端；仅 HF 有）", "quality", False),
+    "qwen3_1_7b":     ("qwen3_1_7b_hf", "Qwen3-1.7B 官方权重（仅转换时需要；转好可删）",
+                       "quality", False),
     "qwen3_1_7b_ct2": ("__converted__",
                        "Qwen3-1.7B-CT2（质量档翻译；需 HF 权重 + convert 1.7b）",
                        "quality", False),
@@ -62,6 +64,7 @@ def model_path(name: str) -> Path:
         "punc_cpu": "punc-ct-transformer-zh-en-onnx",
         "fsmn_vad": "fsmn-vad-onnx",
         "qwen3_asr": "qwen3-asr-0.6b-onnx-int4",
+        "qwen3_1_7b": "Qwen3-1.7B-hf",
         "qwen3_1_7b_ct2": "Qwen3-1.7B-ct2",
     }
     return MODELS_DIR / paths[name]
@@ -70,7 +73,7 @@ def model_path(name: str) -> Path:
 def cmd_list():
     print(f"模型目录: {MODELS_DIR}\n")
     for tier in ("default", "quality"):
-        title = "默认档（必需）" if tier == "default" else "可选增强"
+        title = "默认档（安装器会一起下）" if tier == "default" else "可选增强"
         print(f"[{title}]")
         for name, (_dl, label, t, req) in CATALOG.items():
             if t != tier:
@@ -99,9 +102,21 @@ def cmd_list():
         print("✔ 必需项齐全，直接启动即可（启动_MaiSubtitle.bat）")
 
 
-def cmd_download(tier: str):
+def cmd_download(targets):
+    """下载：targets 可以是档位（default / all / quality），也可以是 CATALOG 的**键名**
+    （可混写、可多个）—— 设置界面「下载缺失模型」就是按名字调的（2026-09-18）。"""
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-    names = [n for n, e in CATALOG.items() if tier == "all" or e[2] == tier]
+    names = []
+    for t in targets:
+        if t in ("all", "default", "quality"):
+            names += [n for n, e in CATALOG.items() if t == "all" or e[2] == t]
+        elif t in CATALOG:
+            names.append(t)
+        else:
+            print(f"未知下载项: {t}（可用档位: all/default/quality；"
+                  f"可用名字: {', '.join(CATALOG)}）")
+            sys.exit(2)
+    names = list(dict.fromkeys(names))          # 去重保序（档位与名字可能撞）
     to_run = []
     for n in names:
         dl = CATALOG[n][0]
@@ -119,15 +134,16 @@ def cmd_download(tier: str):
         if r.returncode != 0:
             print("下载有失败项（网络/镜像问题），重跑即可断点续传")
     # 翻译模型：HF 权重已就位但 CT2 还没转换 → 自动转换（否则跑起来没译文）
-    if (dir_size_mb(model_path("qwen_1_5b")) > 500
-            and dir_size_mb(model_path("qwen_1_5b_ct2")) < 100):
-        print("\n检测到 HF 权重但缺 CT2 版 → 自动转换 Qwen2.5-1.5B-CT2 …")
-        import subprocess
-        r = subprocess.run([sys.executable,
-                            str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), "1.5b"])
-        if r.returncode != 0:
-            print("[注意] 自动转换失败（见上）；可单独重跑："
-                  "scripts/model_manager.py convert qwen_1_5b")
+    for hf, ct2, key in (("qwen_1_5b", "qwen_1_5b_ct2", "1.5b"),
+                         ("qwen3_1_7b", "qwen3_1_7b_ct2", "1.7b")):
+        if (dir_size_mb(model_path(hf)) > 500 and dir_size_mb(model_path(ct2)) < 100):
+            print(f"\n检测到 {hf} 的 HF 权重但缺 CT2 版 → 自动转换 {ct2} …")
+            import subprocess
+            r = subprocess.run([sys.executable,
+                                str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), key])
+            if r.returncode != 0:
+                print(f"[注意] 自动转换失败（见上）；可单独重跑："
+                      f"scripts/model_manager.py convert {hf}")
     # FireRedVAD：权重下好了但 ONNX 还没导出 → 自动导出（否则 VAD 用不上 FireRed）
     if (dir_size_mb(MODELS_DIR / "fireredvad") > 1
             and dir_size_mb(model_path("firered")) <= 0.1):
@@ -143,9 +159,10 @@ def cmd_download(tier: str):
 
 def cmd_convert(name: str):
     import subprocess
-    key = {"qwen_1_5b": "1.5b", "qwen3_1_7b_ct2": "1.7b"}.get(name)
+    key = {"qwen_1_5b": "1.5b", "qwen3_1_7b": "1.7b",
+           "qwen3_1_7b_ct2": "1.7b"}.get(name)
     if key is None:
-        print(f"无可转换项: {name}（可用: qwen_1_5b / qwen3_1_7b_ct2）")
+        print(f"无可转换项: {name}（可用: qwen_1_5b / qwen3_1_7b / qwen3_1_7b_ct2）")
         sys.exit(2)
     r = subprocess.run([sys.executable,
                         str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), key])
@@ -205,18 +222,20 @@ def cmd_size():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["list", "download", "convert", "export", "delete", "size"])
-    ap.add_argument("target", nargs="?", default="all")
+    # download 可给多个目标（档位或 CATALOG 键名）；其余命令只用第一个
+    ap.add_argument("target", nargs="*", default=[])
     a = ap.parse_args()
+    one = a.target[0] if a.target else ""
     if a.cmd == "list":
         cmd_list()
     elif a.cmd == "download":
-        cmd_download(a.target if a.target in ("all", "default", "quality") else "all")
+        cmd_download(a.target or ["all"])
     elif a.cmd == "convert":
-        cmd_convert(a.target)
+        cmd_convert(one)
     elif a.cmd == "export":
-        cmd_export(a.target)
+        cmd_export(one)
     elif a.cmd == "delete":
-        cmd_delete(a.target)
+        cmd_delete(one)
     elif a.cmd == "size":
         cmd_size()
 

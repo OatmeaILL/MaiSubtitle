@@ -8,6 +8,8 @@
   - **VAD 参数联动**：FireRed 与 Silero/FSMN 的参数互斥显示（改对侧的参数不生效）。
   - **重启提示**：改到需要重启的项，保存后由主程序弹窗询问是否立即重启。
 """
+import os
+import sys
 import threading
 import time
 
@@ -19,6 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 
 from .asr import WS_BACKENDS, find_qwen_dir
+from .config import PROJECT_ROOT
 
 # 识别引擎：一个下拉同时表达 backend 与（whisper 唯一的）模型 ——
 # 以前"选 whisper 再选 whisper 模型"两层让人迷惑，且 whisper 仅剩 large-v3-turbo。
@@ -114,6 +117,25 @@ class SettingsDialog(QDialog):
         self.lb_models.setToolTip("按界面上当前的选择实时刷新；缺模型时启动日志与托盘也会提示；"
                                   "补救：scripts/model_manager.py list")
         lay.addWidget(self.lb_models)
+        # 「下载缺失模型」：选到本机没有的模型时出现，点一下就地补下（2026-09-18）。
+        # 下载跑在子进程里（不进 UI 线程），进度只写 dict、由主线程轮询上屏 ——
+        # 跨线程碰 Qt 会随机卡死；对话框随时可能被关掉，所以也不往它发信号。
+        self.btn_dl = QPushButton("下载缺失的模型")
+        self.btn_dl.setToolTip("把「模型状态」里标 ✘ 的那几项下齐（走 ModelScope/HF 镜像，"
+                               "可断点续传；FireRedVAD / Qwen 会自动做导出/转换）")
+        self.btn_dl.clicked.connect(self._download_missing)
+        self.btn_dl.hide()
+        self.lb_dl = QLabel("")
+        self.lb_dl.setWordWrap(True)
+        self.lb_dl.hide()
+        row_dl = QHBoxLayout()
+        row_dl.addWidget(self.btn_dl)
+        row_dl.addWidget(self.lb_dl, 1)
+        lay.addLayout(row_dl)
+        self._dl = {"running": False, "done": False, "rc": None, "tail": []}
+        self._dl_timer = QTimer(self)
+        self._dl_timer.setInterval(600)
+        self._dl_timer.timeout.connect(self._dl_poll)
         # 换引擎 / 换 VAD → 状态行立刻跟着变（不用先保存）
         self.cmb_engine.currentIndexChanged.connect(self._refresh_models)
         self.cmb_vad.currentIndexChanged.connect(self._refresh_models)
@@ -396,6 +418,7 @@ class SettingsDialog(QDialog):
             "决定「接缝标点判定」用谁来补标点。当前只喂接缝窗口（上一行尾 12 词 +\n"
             "本段前 12 词），比整句喂省一半以上。CPU 模型需要 models/punc-ct-transformer-zh-en-onnx。")
         form.addRow("  └ 补标点引擎（重启生效）", self.cmb_punct)
+        self.cmb_punct.currentIndexChanged.connect(self._refresh_models)   # cpu 缺模型时提示下载
 
         self.chk_final = QCheckBox("每行定稿补标点：识别出的半句补上句读再上屏")
         self.chk_final.setChecked(bool(getattr(cfg, "punct_final", True)))
@@ -496,9 +519,14 @@ class SettingsDialog(QDialog):
     def _tab_glossary(self, cfg):
         page = QWidget()
         form = QFormLayout(page)
-        form.addRow(_desc("术语库路径与质量开关；术语库也能用 F8 直接打开编辑器。"))
+        form.addRow(_desc("术语库**默认关闭**：填了路径才启用（术语会进识别提示词与翻译术语保护）。"
+                          "F8 可直接打开编辑器，保存过就自动启用。"))
 
         self.ed_glossary = QLineEdit(cfg.glossary_path or "")
+        self.ed_glossary.setPlaceholderText("留空 = 不启用术语库")
+        self.ed_glossary.setToolTip(
+            "术语库是 CSV/JSON 文件（源码仓里有 glossary.example.csv 样例）。\n"
+            "留空 = 完全不用术语；填了才读。相对路径按项目根目录解析。")
         btn = QPushButton("浏览…")
         btn.clicked.connect(self._browse_glossary)
         row = QHBoxLayout()
@@ -666,17 +694,114 @@ class SettingsDialog(QDialog):
         self.lbl_hint.setText("已套用低延迟预设：实时渐进显示 + FireRed 单句上限 4s + "
                               "断句静音 500ms + 每句停留 900ms（保存后重启生效）")
 
+    def _model_kw(self) -> dict:
+        """界面上"当前选着"的引擎/后端/VAD（还没保存也算）——状态行与下载都按它算。"""
+        return dict(engine=self.cmb_engine.currentText(),
+                    backend=self.cmb_backend.currentData() or self.cmb_backend.currentText(),
+                    vad=self.cmb_vad.currentText())
+
     def _refresh_models(self, *_a):
         """按**界面上当前选的值**刷新模型状态行（不必先保存；换引擎/换 VAD 会触发）。"""
-        if not hasattr(self, "lb_models"):
-            return                       # 构造过程中信号先到、状态行还没建好
+        if not hasattr(self, "_dl"):
+            return                       # 构造过程中信号先到、状态行/下载行还没建好
         from . import selfcheck
-        kw = dict(engine=self.cmb_engine.currentText(),
-                  backend=self.cmb_backend.currentData() or self.cmb_backend.currentText(),
-                  vad=self.cmb_vad.currentText())
+        kw = self._model_kw()
         self.lb_models.setText("模型状态：" + "　".join(selfcheck.summary(self.cfg, **kw)))
+        missing = selfcheck.missing_downloads(self.cfg, **kw)
         self.lb_models.setStyleSheet(
-            "color: #4a8a4a;" if not selfcheck.check(self.cfg, **kw) else "color: #c05a2a;")
+            "color: #4a8a4a;" if not missing else "color: #c05a2a;")
+        # 选到的模型没装 → 亮出「下载」按钮（说明写清是哪些、多大）
+        if self._dl["running"]:
+            return                       # 下载中：按钮状态由 _dl_poll 管
+        self.btn_dl.setVisible(bool(missing))
+        if missing:
+            self.btn_dl.setText(f"下载缺失的模型（{len(missing)} 项）")
+            self.btn_dl.setToolTip("\n".join("· " + d for _, d in missing))
+
+    def _download_missing(self):
+        """把界面上选中但缺失的模型就地补下（子进程 + 主线程轮询进度）。"""
+        from . import selfcheck
+        missing = selfcheck.missing_downloads(self.cfg, **self._model_kw())
+        if not missing:
+            return
+        desc = "\n".join("· " + d for _, d in missing)
+        ans = QMessageBox.question(
+            self, "下载缺失的模型",
+            f"本机还没有这些模型：\n\n{desc}\n\n"
+            "现在下载吗？走 ModelScope / HF 镜像，可断点续传；"
+            "FireRedVAD 与 Qwen 会在下完后自动导出 / 转换。\n"
+            "下载期间程序照常用；下完重启一次即生效。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        names = [n for n, _ in missing]
+        self._dl.update(running=True, done=False, rc=None, tail=[])
+        self.btn_dl.setEnabled(False)
+        self.btn_dl.setText("下载中…")
+        self.lb_dl.setVisible(True)
+        self.lb_dl.setText("正在启动下载…（窗口可以关掉，下载会继续）")
+        self.lb_dl.setStyleSheet("color: #d08a2a;")
+        self._dl_timer.start()
+
+        cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "model_manager.py"),
+               "download", *names]
+        try:
+            import subprocess
+            # 合并 stderr：下载脚本的进度条/警告都走 stderr，分开读会看不到
+            flags = 0x08000000 if os.name == "nt" else 0     # CREATE_NO_WINDOW
+            p = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                 errors="replace", creationflags=flags)
+        except Exception as e:
+            self._dl.update(running=False, done=True, rc=-1)
+            self.lb_dl.setText(f"启动下载失败：{type(e).__name__}: {e}")
+            self.lb_dl.setStyleSheet("color: #c05a2a;")
+            self.btn_dl.setEnabled(True)
+            self._dl_timer.stop()
+            return
+
+        def _reader(proc):
+            # 只写 dict，不碰 Qt（对话框随时可能被关掉/销毁）
+            try:
+                for line in proc.stdout:
+                    self._dl["tail"].append(line.rstrip())
+                    del self._dl["tail"][:-6]        # 只留最后几行做进度显示
+            except Exception:
+                pass
+            try:
+                self._dl["rc"] = proc.wait()
+            except Exception:
+                self._dl["rc"] = -1
+            self._dl["running"] = False
+            self._dl["done"] = True
+
+        threading.Thread(target=_reader, args=(p,), daemon=True,
+                         name="model-download").start()
+
+    def _dl_poll(self):
+        """主线程轮询下载进度（子进程输出 → 状态标签）。"""
+        st = self._dl
+        if not st["running"] and not st["done"]:
+            self._dl_timer.stop()
+            return
+        tail = st["tail"][-1] if st["tail"] else ""
+        if st["running"]:
+            self.lb_dl.setText("下载中…（可关掉本窗口，下载会继续）\n" + tail[-160:])
+            return
+        # 结束：rc==0 且没有项目再缺失才算成功
+        self._dl_timer.stop()
+        self.btn_dl.setEnabled(True)
+        from . import selfcheck
+        left = selfcheck.missing_downloads(self.cfg, **self._model_kw())
+        if st["rc"] == 0 and not left:
+            self.lb_dl.setText("✔ 下载完成 —— 重启程序后生效")
+            self.lb_dl.setStyleSheet("color: #4a8a4a;")
+        else:
+            self.lb_dl.setText(f"下载结束（退出码 {st['rc']}），仍有 {len(left)} 项缺失："
+                               "重跑一次可断点续传，或看 logs/ 里的输出\n" + tail[-160:])
+            self.lb_dl.setStyleSheet("color: #c05a2a;")
+        self._refresh_models()
 
     def _sync_vad(self):
         fr = self.cmb_vad.currentText() == "firered"

@@ -87,9 +87,11 @@ MODEL_MARKS = [
     ("Hy-MT2-1.8B（翻译）", "models/Hy-MT2-1.8B/model.safetensors"),
     ("FireRedVAD ONNX", "models/fireredvad-onnx/stream_vad.onnx"),
     ("Silero VAD（VAD 兜底）", "models/silero_vad.onnx"),
+    ("标点 CPU 模型", "models/punc-ct-transformer-zh-en-onnx/model_quant.onnx"),
 ]
-# 下载项（都走 ModelScope/镜像）：whisper 识别、Hy-MT2 翻译、FireRedVAD（下完要导出 ONNX）
-DL_DEFAULT = ["whisper_turbo", "silero_vad", "firered", "hymt2"]
+# 下载项（都走 ModelScope/镜像）：whisper 识别、Hy-MT2 翻译、FireRedVAD（下完要导出 ONNX）、
+# 标点 CPU 小模型（每行定稿补标点：中文走它，1~4ms、不占 GPU；2026-09-18 进默认档）
+DL_DEFAULT = ["whisper_turbo", "silero_vad", "firered", "hymt2", "punc_cpu"]
 # FireRedVAD 的 ONNX 由原始权重导出（要 torch + fireredvad 包，两步都在本脚本里做）
 FIRERED_ONNX = ROOT / "models" / "fireredvad-onnx" / "stream_vad.onnx"
 
@@ -460,7 +462,7 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
         say("\n[3/5] 模型：跳过（--skip-models）")
     elif mmiss:
         say(f"\n[3/5] 模型：缺 {'、'.join(mmiss)} → 下载 {' '.join(DL_DEFAULT)}"
-            f"（约 5.4GB：whisper 1.5 + Hy-MT2 3.9）")
+            f"（约 5.7GB：whisper 1.5 + Hy-MT2 3.9 + 标点 0.3）")
         if fix:
             if run([VENV_PY, str(ROOT / "scripts" / "download_models.py"),
                     "--only", *DL_DEFAULT]) != 0:

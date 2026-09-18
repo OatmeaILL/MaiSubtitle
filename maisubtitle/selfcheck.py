@@ -10,16 +10,34 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from .asr import WS_BACKENDS
-from .config import MODELS_DIR
+from .config import MODELS_DIR, PROJECT_ROOT
 
 # 翻译引擎 → [(目录, 判据文件), …]：第一个是本引擎自己的模型，后面是回落链
+# ⚠ 判据必须是**真权重**（model.safetensors / model.bin），不能拿 config.json 顶 ——
+#   下到一半（4GB 的 safetensors 还没落盘）也会被判成"已就绪"（同类坑见本文件注释）。
 ENGINE_CANDIDATES = {
     "qwen": [("Qwen2.5-1.5B-Instruct-ct2", "model.bin")],
     "qwen3": [("Qwen3-1.7B-ct2", "model.bin"),
               ("Qwen2.5-1.5B-Instruct-ct2", "model.bin")],
-    "hymt2": [("Hy-MT2-1.8B", "config.json"),
+    "hymt2": [("Hy-MT2-1.8B", "model.safetensors"),
               ("Qwen2.5-1.5B-Instruct-ct2", "model.bin")],
+}
+
+# 「选到的模型没装」→ 一键补下的映射。名字 = scripts/model_manager.py 的 CATALOG 键
+# （download 会连带做 FireRedVAD 导出 / Qwen HF→CT2 转换，见 model_manager.cmd_download）。
+DOWNLOAD_NAME = {
+    "whisper": ("whisper_turbo", "Whisper large-v3-turbo 识别权重（约 1.5GB）"),
+    "qwen3-onnx": ("qwen3_asr", "Qwen3-ASR-0.6B ONNX int4（约 1.4GB）"),
+    "hymt2": ("hymt2", "Hy-MT2-1.8B 翻译权重（约 3.9GB；需要 torch）"),
+    "qwen": ("qwen_1_5b", "Qwen2.5-1.5B（约 3GB；下完自动转 CT2）"),
+    "qwen3": ("qwen3_1_7b", "Qwen3-1.7B（约 3.4GB；下完自动转 CT2）"),
+    "firered": ("firered", "FireRedVAD 权重（约 2MB；下完自动导出 ONNX）"),
+    "fsmn": ("fsmn_vad", "FSMN-VAD 备选分句模型"),
+    "silero": ("silero_vad", "Silero VAD 分句兜底（约 0.6MB）"),
+    "punc": ("punc_cpu", "标点 CPU 模型（中文补标点，约 0.27GB）"),
 }
 
 
@@ -80,6 +98,40 @@ def summary(cfg, engine: str | None = None, backend: str | None = None,
     out = []
     for ok, name in (_asr_state(cfg, backend), _mt_state(cfg, engine), _vad_state(cfg, vad)):
         out.append(f"{'✔' if ok else '✘'} {name}")
+    return out
+
+
+def missing_downloads(cfg, engine: str | None = None, backend: str | None = None,
+                      vad: str | None = None) -> list[tuple[str, str]]:
+    """界面上**选中了但本机没有**的模型 → [(下载名, 人话说明), …]（空 = 都齐）。
+
+    只报"当前选的那个"：选 hymt2 而回落链的 QwenCT2 也没装时，只提示补 hymt2
+    （补上首选就不用回落了）。名字可直接交给 `scripts/model_manager.py download <名字>`
+    —— 它会连带做 FireRedVAD 导出 / Qwen HF→CT2 转换。
+    """
+    out: list[tuple[str, str]] = []
+    b = str(backend or getattr(cfg, "asr_backend", "whisper")
+            or "whisper").strip().lower()
+    if b in ("http", "vllm", "qwen3asr", "qwen3-asr", "funasr", "service") or b in WS_BACKENDS:
+        pass                     # 远端后端：本机没有可下的权重（缺密钥不是"缺模型"）
+    elif not _asr_state(cfg, backend)[0]:
+        out.append(DOWNLOAD_NAME["qwen3-onnx"] if b in ("qwen3-onnx", "qwen3onnx",
+                                                        "qwen3_asr_onnx", "qwenasr")
+                   else DOWNLOAD_NAME["whisper"])
+    eng = str(engine or getattr(cfg, "engine", "hymt2") or "hymt2").strip().lower()
+    d, marker = ENGINE_CANDIDATES.get(eng, ENGINE_CANDIDATES["qwen"])[0]
+    if not (MODELS_DIR / d / marker).exists():
+        out.append(DOWNLOAD_NAME.get(eng) or DOWNLOAD_NAME["qwen"])
+    v = str(vad or getattr(cfg, "vad_engine", "firered") or "firered").lower()
+    if not _vad_state(cfg, vad)[0]:
+        out.append(DOWNLOAD_NAME.get(v) or DOWNLOAD_NAME["silero"])
+    # 补标点：只有明确指定"用 CPU 小模型"时才算缺（auto 模式下没装会走 Qwen，功能不受影响）
+    if str(getattr(cfg, "punct_engine", "auto") or "auto").strip().lower() == "cpu":
+        p = Path(str(getattr(cfg, "punct_cpu_dir", "")
+                     or "models/punc-ct-transformer-zh-en-onnx"))
+        p = p if p.is_absolute() else PROJECT_ROOT / p
+        if not (p / "model_quant.onnx").exists():
+            out.append(DOWNLOAD_NAME["punc"])
     return out
 
 
