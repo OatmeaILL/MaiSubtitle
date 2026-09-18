@@ -182,8 +182,7 @@ def _spawn_bench_window(langs: str) -> "subprocess.Popen | None":
     args = [] if langs == "en,ja,ko,zh" else ["--langs", langs]
     _BENCH_PROC = _spawn_console_window(
         "MaiSubtitle 部署跑分", "bench_deploy.py", args,
-        "[完成] 跑分结束：排名与推荐见上；完整数据 logs/bench_deploy.json；"
-        "精简对照 docs/bench_dev.json。",
+        "[完成] 跑分结束：排名与推荐见上。重新双击 启动_MaiSubtitle.bat 启动程序。",
         "[未完成] 上面就是原因（多半是显存不够或模型缺失）；"
         "可用 --langs en,ja --mts qwen 缩小范围重跑。", "bench")
     return _BENCH_PROC
@@ -191,10 +190,12 @@ def _spawn_bench_window(langs: str) -> "subprocess.Popen | None":
 
 class SettingsDialog(QDialog):
     def __init__(self, cfg, overlay, screen_count: int, parent=None,
-                 cli_overrides: dict | None = None):
+                 cli_overrides: dict | None = None, on_exit_app=None):
         super().__init__(parent)
         self.cfg = cfg
         self.overlay = overlay
+        # 「部署跑分」用：跑分要独占 GPU，确认后先退出主程序再跑（live_demo 传 app.quit）
+        self.on_exit_app = on_exit_app
         # {字段: (磁盘原值, 本次运行的 CLI 覆盖值)}——用户没改动这些字段时保存不写
         # 覆盖值，避免"透传启动一次"把配置里的选择改掉（见 config.save_preserving_cli）
         self._cli = cli_overrides or {}
@@ -241,7 +242,7 @@ class SettingsDialog(QDialog):
         self._dl_active = False          # 下载窗口在跑的标志（_dl_poll 据此收尾）
         # 「部署跑分」入口（2026-09-18 用户要求）：弹独立 cmd 窗口跑全组合跑分，
         # 结束后窗口里直接给排名与推荐 —— 用户在自己电脑上部署时照着选搭配。
-        self.btn_bench = QPushButton("部署跑分（帮你选模型搭配）")
+        self.btn_bench = QPushButton("部署跑分")
         self.btn_bench.setToolTip(
             "对 3 种分句 × 2 种识别 × 3 种翻译做全组合实测（4 语种切片）。\n"
             "耗时约 15~25 分钟、GPU 会跑满；只跑本机已下载的模型。\n"
@@ -254,7 +255,6 @@ class SettingsDialog(QDialog):
         row_bench.addWidget(self.btn_bench)
         row_bench.addWidget(self.lb_bench, 1)
         lay.addLayout(row_bench)
-        self._bench_active = False       # 跑分窗口在跑的标志
         # 换引擎 / 换 VAD → 状态行立刻跟着变（不用先保存）
         self.cmb_engine.currentIndexChanged.connect(self._refresh_models)
         self.cmb_vad.currentIndexChanged.connect(self._refresh_models)
@@ -892,18 +892,11 @@ class SettingsDialog(QDialog):
         self._dl_timer.start()
 
     def _dl_poll(self):
-        """轮询后台子窗口（下载 / 部署跑分共用一个 1s 定时器），谁结束谁收尾。"""
-        if self._dl_active and not _dl_running():
-            self._dl_active = False
-            self._dl_finish()
-        if self._bench_active and not _bench_running():
-            self._bench_active = False
-            self._bench_finish()
-        if not (self._dl_active or self._bench_active):
-            self._dl_timer.stop()
-
-    def _dl_finish(self):
-        """下载窗口收尾：刷新模型状态与缺失清单（进度本身在命令窗口里看）。"""
+        """轮询下载窗口是否结束（进度本身在命令窗口里看）。结束后刷新模型状态。"""
+        if not self._dl_active or _dl_running():
+            return
+        self._dl_active = False
+        self._dl_timer.stop()
         self._refresh_models()
         from . import selfcheck
         left = selfcheck.missing_downloads(self.cfg, **self._model_kw())
@@ -916,26 +909,22 @@ class SettingsDialog(QDialog):
                                "看那个窗口里的报错；重跑一次可断点续传")
             self.lb_dl.setStyleSheet("color: #c05a2a;")
 
-    def _bench_finish(self):
-        """跑分窗口收尾：按钮恢复，指路结果文件。"""
-        self.btn_bench.setEnabled(True)
-        self.lb_bench.setVisible(True)
-        self.lb_bench.setText("跑分结束：排名与推荐在那个命令窗口里；完整数据 "
-                              "logs/bench_deploy.json，精简对照 docs/bench_dev.json")
-        self.lb_bench.setStyleSheet("color: #4a8a4a;")
-
     def _run_bench(self):
-        """「部署跑分」入口：确认后弹独立 cmd 窗口跑全组合跑分（GPU 会跑满）。"""
+        """「部署跑分」入口：跑分要**独占 GPU** —— 主程序驻留的识别/翻译引擎不释放，
+        跑分数据会严重失真（显存挤兑，实测识别慢 30 倍）。所以确认后：
+        ① 弹独立 cmd 窗口（跑分启动本身有模型加载，不依赖本进程存活）；
+        ② 关掉设置窗并退出主程序（退出码 0，守护进程按"主动退出"处理不会重启）；
+        ③ 跑完用户重新启动即可。bench_deploy 里还有 GPU 占用兜底检测（等/询问）。"""
         if _bench_running():
             return
         ret = QMessageBox.question(
             self, "开始部署跑分？",
-            "对 3 种分句 × 2 种识别 × 3 种翻译做全组合实测（4 语种切片）。\n\n"
-            "· 耗时约 15~25 分钟，期间 GPU 会跑满（要打游戏/直播就先缓缓）\n"
-            "· 只跑本机已下载的模型；缺什么命令窗口里会写明怎么补\n"
-            "· 结束后窗口里直接给排名与推荐（程序算法；模型自评仅供参考）\n"
-            "· 完整数据 logs/bench_deploy.json；精简对照 docs/bench_dev.json\n\n"
-            "现在开始？",
+            "跑分要独占 GPU，主程序会先退出（配置自动保存）：\n\n"
+            "· 点「是」后弹出跑分命令窗口，本程序退出\n"
+            "· 跑分约 15~25 分钟，GPU 跑满；只测本机已下载的模型\n"
+            "· 跑完后重新双击 启动_MaiSubtitle.bat 即可\n"
+            "· 结果：窗口里直接给排名与推荐；完整数据 logs/bench_deploy.json\n\n"
+            "继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if ret != QMessageBox.StandardButton.Yes:
             return
@@ -945,12 +934,10 @@ class SettingsDialog(QDialog):
                                   "python scripts/bench_deploy.py")
             self.lb_bench.setStyleSheet("color: #c05a2a;")
             return
-        self._bench_active = True
-        self.btn_bench.setEnabled(False)
-        self.lb_bench.setVisible(True)
-        self.lb_bench.setText("跑分进行中…（进度与排名在那个命令窗口里，结束后这里会提示）")
-        self.lb_bench.setStyleSheet("color: #d08a2a;")
-        self._dl_timer.start()
+        # 先关掉设置窗（finished 回调对 Rejected 不做保存），再退主程序
+        self.close()
+        if callable(self.on_exit_app):
+            self.on_exit_app()
 
     def _sync_vad(self):
         fr = self.cmb_vad.currentText() == "firered"

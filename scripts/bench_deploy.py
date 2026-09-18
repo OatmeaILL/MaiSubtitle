@@ -584,6 +584,55 @@ def combo_score(row) -> float:
 
 # ---------------- 主进程：调度子进程 + 汇总排名 ----------------
 
+GPU_QUIET_MB = 1800.0     # 低于这个占用视为"GPU 空闲"（驱动 + 桌面底噪实测约 1.2GB；
+                          # 主程序驻留识别+翻译引擎后 4GB 起，一眼能区分）
+
+
+def gpu_used_mb() -> float:
+    """当前显存占用（MB）；探测不到（无 N 卡 / 驱动异常）返回 -1，由调用方跳过检查。"""
+    try:
+        import subprocess as _sp
+        r = _sp.run(["nvidia-smi", "--query-gpu=memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, timeout=10)
+        return float(r.stdout.decode("gbk", "replace").strip().splitlines()[0])
+    except Exception:
+        return -1.0
+
+
+def wait_gpu_free(timeout_s: float = 60.0, force: bool = False):
+    """GPU 被占时先等占用方退出 —— **跑分和主程序抢 GPU 会让数据严重失真**。
+
+    实锤：主程序驻留 whisper+hymt2 时再跑分 = 显存挤兑，识别 320ms → 11750ms/段
+    （慢 30 倍，2026-09-18 冒烟实测）。设置里的「部署跑分」会先退出主程序再弹本窗口，
+    但用户手动跑分时可能忘关主程序 → 这里兜底：等它退出（最多 60s），超时问一句。
+    """
+    if force:
+        return
+    used = gpu_used_mb()
+    if used < 0 or used <= GPU_QUIET_MB:
+        return
+    print(f"[注意] GPU 已被占用 {used:.0f}MB（多半是 MaiSubtitle 主程序还开着，"
+          "或别的程序在用显卡）")
+    print("       跑分要独占 GPU，否则结果失真。等它退出（最多 60s）…", flush=True)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(2)
+        used = gpu_used_mb()
+        if 0 <= used <= GPU_QUIET_MB:
+            print("       GPU 已空闲，开始跑分\n", flush=True)
+            return
+    try:
+        r = input(f"等待超时（仍占 {used:.0f}MB）。先退出占用 GPU 的程序再跑分最准；"
+                  "仍要继续吗？[y/N] ").strip().lower()
+    except EOFError:
+        r = ""
+    if r != "y":
+        print("[未执行] 已取消。退出 MaiSubtitle / 其它占显卡的程序后重跑即可。")
+        sys.exit(2)
+    print("[注意] 你选择了继续：以下延迟数据偏高，仅供参考\n", flush=True)
+
+
 def run_parent(args) -> int:
     ok_vad, ok_asr, ok_mt = print_models()
     if args.list:
@@ -593,6 +642,8 @@ def run_parent(args) -> int:
         if not ok_vad or not ok_asr:
             return 2
         print("[注意] 只有识别没有翻译 → 只跑识别部分（译文留空）")
+
+    wait_gpu_free(force=args.force)
 
     langs = [x for x in args.langs.split(",") if x]
     vads = [k for k, _d, _l, _m in ok_vad]
@@ -798,6 +849,8 @@ def main():
     ap.add_argument("--term-rows", type=int, default=4, help="每语种挑几行做术语对照")
     ap.add_argument("--top", type=int, default=3, help="推荐榜显示前几名")
     ap.add_argument("--out", default="logs/bench_deploy.json")
+    ap.add_argument("--force", action="store_true",
+                    help="跳过 GPU 占用检测（默认：被占就等主程序退出，跑分要独占 GPU）")
     ap.add_argument("--asr", default="", help="（内部）子进程只跑这个识别后端")
     ap.add_argument("--vads", default="", help="（内部）子进程要跑的 VAD")
     ap.add_argument("--mts", default="", help="（内部）子进程要跑的翻译模型")

@@ -420,7 +420,8 @@ def _open_settings():
             _settings_dlg.activateWindow()
             return
         from maisubtitle.settings_ui import SettingsDialog
-        dlg = SettingsDialog(cfg, overlay, len(app.screens()), cli_overrides=cli_overrides)
+        dlg = SettingsDialog(cfg, overlay, len(app.screens()),
+                             cli_overrides=cli_overrides, on_exit_app=app.quit)
         _settings_dlg = dlg
         # **非模态**：模态会挡掉其它窗口的输入 → 设置开着时悬浮窗就拖不动了（用户实报）。
         # 置顶是为了不被"总在最前"的悬浮窗压住。
