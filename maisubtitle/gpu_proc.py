@@ -276,6 +276,12 @@ class GpuWorker:
                 if "chunk" in msg:
                     end = time.perf_counter() + timeout    # 每块都续期
                     yield msg.get("chunk") or ""
+                    continue
+                if not msg.get("ok"):
+                    # 子进程报错（例如引擎不支持流式）必须**立刻**抛出：以前这里只认
+                    # chunk/done，错误回包被当空气 → 白等 30s 超时，还会被当成"GPU 卡死"
+                    # 去重启子进程，真因被彻底盖掉（2026-09-18 实锤：Hy-MT2 整句译文丢失）。
+                    raise RuntimeError(str(msg.get("error") or "子进程报错"))
             self._await(q, rid, method, timeout)
         finally:
             self._lock.release()

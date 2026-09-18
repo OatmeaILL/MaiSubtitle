@@ -187,9 +187,24 @@ def main(argv=None):
             elif method == "translate_stream":
                 mt = ensure_mt()
                 mt.set_terms(a.get("terms") or [])
-                for chunk in mt.translate_stream(a["text"], a["lang"],
-                                                 context=list(a.get("context") or [])):
-                    send({"id": rid, "chunk": chunk})
+                if not hasattr(mt, "translate_stream"):
+                    # 引擎不支持逐 token 流式（HyMT2 走 PyTorch、NullMT 是占位）→ 退化成
+                    # "整句一次产出"，仍按流式协议回一块 + done。
+                    # ⚠ 不能直接调 mt.translate_stream：子进程抛 AttributeError 后，父进程
+                    # 的流式循环只认 chunk/done，会一直等到 30s 超时 → **整句译文丢失**
+                    #（2026-09-18 实锤：Hy-MT2 完全不出译文，日志只有 translate_stream 流式超时）。
+                    try:
+                        out = mt.translate(a["text"], a["lang"],
+                                           context=list(a.get("context") or []))
+                    except TypeError:               # 不支持 context 的旧实现
+                        out = mt.translate(a["text"], a["lang"])
+                    dst = out[0] if isinstance(out, (tuple, list)) else out
+                    if dst:
+                        send({"id": rid, "chunk": dst})
+                else:
+                    for chunk in mt.translate_stream(a["text"], a["lang"],
+                                                     context=list(a.get("context") or [])):
+                        send({"id": rid, "chunk": chunk})
                 send({"id": rid, "done": True})
                 send({"id": rid, "ok": True, "result": None})
             elif method == "chat":

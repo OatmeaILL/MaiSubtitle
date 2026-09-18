@@ -52,11 +52,22 @@ HF_MODELS = {
         "ms_fallback": "pengzhendong/faster-whisper-large-v3-turbo",
     },
     # Qwen3-ASR-0.6B 的 ONNX INT4 导出：**备选识别后端**（设置里选 Qwen3-ASR 才需要）。
-    # 只存在于 HuggingFace（ModelScope 无镜像）。
+    # ⚠ 源必须是 ONNX 导出方 `andrewleech/qwen3-asr-0.6b-onnx`：它的 config.json 里有
+    #   `mel` 与 `special_tokens` 两段，模型类直接读（asr_qwen_onnx.py）。
+    #   曾经错写成 `vrfai/Qwen3-ASR-0.6B-int4` —— 那是**transformers 格式**的同名仓库，
+    #   文件集里根本没有 encoder.int4.onnx，却会把 config.json 覆盖成 transformers 版
+    #   → 运行期 `KeyError: 'mel'`，且多下 925MB 用不上的 safetensors（2026-09-18 实锤）。
+    #   patterns 只取运行需要的文件：该仓库另有 3.4GB 的 tar.gz 打包件，不下。
     "qwen3_asr_0_6b_onnx_int4": {
-        "repo": "vrfai/Qwen3-ASR-0.6B-int4",
+        "repo": "andrewleech/qwen3-asr-0.6b-onnx",
         "dest": "qwen3-asr-0.6b-onnx-int4",
-        "need": ["config.json", "tokenizer.json", "encoder.int4.onnx"],
+        "patterns": ["config.json", "preprocessor_config.json", "added_tokens.json",
+                     "tokenizer.json", "encoder.int4.onnx", "encoder.int4.onnx.data",
+                     "decoder_init.int4.onnx", "decoder_step.int4.onnx",
+                     "embed_tokens.bin", "decoder_weights.int4.data"],
+        "need": ["config.json", "tokenizer.json", "encoder.int4.onnx",
+                 "decoder_init.int4.onnx", "decoder_step.int4.onnx",
+                 "embed_tokens.bin", "decoder_weights.int4.data"],
     },
 }
 

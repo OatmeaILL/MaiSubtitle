@@ -113,6 +113,15 @@ class Qwen3AsrOnnx:
             raise FileNotFoundError(f"缺少 {d/'encoder.int4.onnx'}")
         self._dir = str(d)
         cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
+        if "mel" not in cfg or "special_tokens" not in cfg:
+            # 实锤（2026-09-18）：该目录的 config.json 曾被一次**下错仓库**的下载覆盖成
+            # transformers 版（只有 architectures/model_type/…），运行期抛 `KeyError: 'mel'`，
+            # 完全看不出是配置被换掉了。这里直接说清楚缺什么、从哪补。
+            raise ValueError(
+                f"{d/'config.json'} 不是 ONNX 导出方的配置（缺 mel / special_tokens）："
+                "该文件被别的仓库覆盖过。修复：重新下载该模型 "
+                "（scripts/download_models.py --only qwen3_asr_0_6b_onnx_int4，"
+                "源为 andrewleech/qwen3-asr-0.6b-onnx）")
         self.spec = cfg["mel"]
         st = cfg["special_tokens"]
         self.eos_ids = set(st["eos_token_ids"]) | {st["im_end_token_id"]}
