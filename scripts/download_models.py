@@ -368,7 +368,10 @@ def main():
             continue
         if state.get(name) == "ok":
             print(f"[stale] {name}（state 记为已下载，但本地不存在 → 重新下载）")
-        print(f"[down] {name} ...")
+        # 前面可能留着 hf_hub 的进度条（tqdm 用 \r 重写当前行、不换行），
+        # 直接 print 会和它挤在同一行（实测：`Download complete: …| 1.62GB [down] silero_vad …`）。
+        # 先换一行再打印，日志就是干净的。
+        print(f"\n[down] {name} ...", flush=True)
         if name in HF_MODELS:
             spec = HF_MODELS[name]
             ok = False
