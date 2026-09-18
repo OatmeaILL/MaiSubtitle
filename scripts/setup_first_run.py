@@ -45,6 +45,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / ".venv"
 VENV_PY = VENV / "Scripts" / "python.exe"
 REQ = ROOT / "requirements.txt"
+LOGS_DIR = ROOT / "logs"          # 放生成物（如"去掉 torch 的清单"），不污染项目根目录
 
 # ---- PyPI 源：**先测速再选**（2026-09-18 实测，同一 numpy wheel / torch 前 20MB）----
 #   清华 24.2 / 中科大 18.9 / 腾讯云 11.0 / 阿里云 **0.22** MB/s —— 差 100 倍，
@@ -174,6 +175,25 @@ def cuda_index_reachable(seconds: int = 8) -> bool:
             return r.status == 200
     except Exception:
         return False
+
+
+def reqs_without_torch() -> Path:
+    """requirements.txt 去掉裸 `torch` 那一行（写进 logs/，不改原文件）。
+
+    为什么要这份：决定装 CUDA 版 torch 时，若先按原清单装了 CPU 版 torch，稍后换 CUDA 版
+    就要 pip 去**卸载**已有的 torch/sympy —— 本机 pip 在卸载步骤会卡住不动
+    （2026-09-18 实测：日志停在 `Uninstalling sympy-1.14.0:`，一停几个小时）。
+    一开始就不装 CPU 版，既省 500MB 也绕过整个卸载路径。
+    """
+    out = LOGS_DIR / "requirements-notorch.txt"
+    keep = []
+    for line in REQ.read_text(encoding="utf-8").splitlines():
+        if line.strip().lower() in ("torch", "torch "):     # 裸 torch 行才去掉
+            continue
+        keep.append(line)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    return out
 
 
 # ---------------- PyPI 源：先测速，再选最快的 ----------------
@@ -363,11 +383,27 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
             say(f"\n[1/5] 依赖：缺 {len(miss)} 个 → {' '.join(miss)}")
             if fix:
                 name, _, _ = mirror()          # 先测速选源（打印各源速度）
-                say(f"      用「{name}」装 requirements.txt（缺 {len(miss)} 个，约 3GB 含 torch）…")
-                if pip_install(["-r", str(REQ)]) != 0:
+                # 有 N 卡 + 官方源可达 → **一开始就别装 CPU 版 torch**：
+                # 先装 CPU 版再换 CUDA 版，pip 要"卸载"已装的 torch/sympy，而本机 pip 在卸载
+                # 那一步会卡死（2026-09-18 实测：日志停在 Uninstalling sympy，停了几小时）。
+                cuda_first = has_nvidia_gpu() and cuda_index_reachable()
+                if cuda_first:
+                    say(f"      检测到 N 卡 + 官方源可达 → 跳过 CPU 版 torch，"
+                        f"直接装 CUDA 版（{TORCH_CUDA_SPEC}，约 2.4GB，实测约 3 分钟）")
+                    rc = pip_install(["-r", str(reqs_without_torch())])
+                else:
+                    say(f"      用「{name}」装 requirements.txt（缺 {len(miss)} 个）…")
+                    rc = pip_install(["-r", str(REQ)])
+                if rc != 0:
                     say("      [错误] 装依赖失败：看上面的报错（网络/镜像问题居多）；"
                         "可换一家源重试：安装_首次使用.bat --mirror 清华")
                     return False
+                if cuda_first:
+                    # --no-deps：torch 的依赖（filelock/networkx/jinja2/fsspec/typing-extensions）
+                    # 上一步都装好了；带上依赖反而会让 pip 去动 sympy（torch 2.6 钉 1.13.1，
+                    # 本机是 1.14.0）—— 卸载那步正是会卡死的地方。开发机就是
+                    # sympy 1.14 + torch 2.6.0+cu124 这么跑着的，没问题。
+                    pip_install([TORCH_CUDA_SPEC], index_url=TORCH_CUDA_INDEX, no_deps=True)
                 miss = missing_imports(CORE_IMPORTS)
                 if miss:
                     say(f"       装完仍缺：{' '.join(miss)}")
@@ -378,32 +414,20 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
         else:
             say("\n[1/5] 依赖：[OK] 齐全")
 
-    # ---- 1b. 显卡体检 +（能连官方源就）试装 CUDA 版 torch ----
+    # ---- 1b. 显卡体检（要不要装 CUDA torch 已在第 1 步决定并执行过）----
     if not missing_imports(["torch"]):
         if torch_has_cuda():
             say("      torch 带 CUDA ✓（hymt2 翻译走 GPU）")
         else:
-            say("      [注意] 装到的 torch 不带 CUDA —— 新版 PyPI 的 Windows 轮子都是 CPU 版"
-                "（国内镜像也没有 CUDA 版），hymt2 会跑 CPU")
+            say("      [注意] torch 不带 CUDA → hymt2 跑 CPU（能用，实测每句 1~2 秒）")
             if not has_nvidia_gpu():
-                say("             本机没检测到 NVIDIA 显卡（nvidia-smi），跑 CPU 是正常的；"
+                say("             本机没有 NVIDIA 显卡（nvidia-smi），这样是正常的；"
                     "想更快可换引擎：设置 → 翻译引擎 → qwen（CT2，约 0.22s/句）")
-            elif not fix:
-                say(f"             真装时会试装 CUDA 版：{TORCH_CUDA_SPEC}（约 2.4GB）")
-            elif not cuda_index_reachable():
-                say("             官方源（download.pytorch.org）连不上 → 跳过 CUDA torch，"
-                    "hymt2 照样能用（跑 CPU，实测每句 1~2 秒）")
-                say("             机器上已有别的带 CUDA 的 torch？"
-                    "设置 → 外部 torch 目录 指一下即可（不用下载）")
             else:
-                say(f"             检测到 N 卡 → 试装 CUDA 版 torch"
-                    f"（{TORCH_CUDA_SPEC}，约 2.4GB，实测约 5 分钟）…")
-                pip_install([TORCH_CUDA_SPEC], index_url=TORCH_CUDA_INDEX)
-                if torch_has_cuda():
-                    say("      [OK] CUDA 版 torch 装好了（hymt2 翻译走 GPU）")
-                else:
-                    say("      [注意] CUDA 版没装成 → 保持 CPU 版；"
-                        "可稍后重跑本脚本，或在设置里指定外部 torch 目录")
+                say("             原因：官方源当时不可达，或 CUDA 版没装上。两条替代：")
+                say("               ① 设置 → 外部 torch 目录：指一个已有的 CUDA torch，"
+                    "零下载（机器上别的 AI 环境里有就行）")
+                say("               ② 设置 → 翻译引擎 → qwen（CT2，约 0.22s/句）")
 
     # ---- 2. 两个必须 --no-deps 单独装的包（见文件头 ②）----
     if skip_deps:
