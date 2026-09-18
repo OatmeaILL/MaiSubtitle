@@ -1,6 +1,15 @@
 models/
 logs/
-testdata/
+# testdata/ 整体不进 git；只有部署跑分用的 4 语种切片 + 参考文本入库（2026-09-18）
+testdata/*
+!testdata/_clip_en.wav
+!testdata/_clip_ja.wav
+!testdata/_clip_ko.wav
+!testdata/_clip_zh.wav
+!testdata/_clip_en.ref.txt
+!testdata/_clip_ja.ref.txt
+!testdata/_clip_ko.ref.txt
+!testdata/_clip_zh.ref.txt
 tools/
 __pycache__/
 dist/

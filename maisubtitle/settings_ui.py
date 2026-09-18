@@ -94,6 +94,7 @@ def _row(form, text, widget):
 # ---- 「下载缺失的模型」：弹独立 cmd 窗口跑（与 安装_首次使用.bat 同款）----
 # 模块级：设置窗口关掉再打开也要能看到"已经在下载"，避免起第二个进程抢同一个文件。
 _DL_PROC = None
+_BENCH_PROC = None        # 部署跑分窗口的进程句柄（与下载窗口互不干扰，各留一个槽）
 
 
 def _dl_running() -> bool:
@@ -101,38 +102,38 @@ def _dl_running() -> bool:
     return _DL_PROC is not None and _DL_PROC.poll() is None
 
 
-def _spawn_download_window(names: list) -> "subprocess.Popen | None":
-    """新开一个命令窗口跑 `model_manager.py download <名字…>`（看得见进度与报错）。
+def _spawn_console_window(title: str, script: str, args: list,
+                          done_text: str, fail_text: str,
+                          tag: str) -> "subprocess.Popen | None":
+    """新开一个命令窗口跑 `scripts/<script> <args…>`（看得见进度与报错）。
 
     为什么不用管道捕获输出（2026-09-18 用户实报后改）：tqdm 的进度条是 `\\r` 刷新的
     整行，捕获后只能显示截断的一小截；而且设置窗口一关就完全没界面了。改成新控制台后，
     进度、镜像回落、报错都摆在用户面前 —— 与 安装_首次使用.bat 的体验一致。
     bat 按项目硬约束落成 **GBK + CRLF**，并带 `PYTHONIOENCODING=gbk:replace`
     （见 HANDOVER §五：脚本往控制台打印不能用 ✔/⚠ 这类 GBK 编不出的字符）。
-    返回 None 表示已有一个在跑（不重复启动）。
+    进程句柄由调用方存模块级（下载 _DL_PROC / 跑分 _BENCH_PROC）：设置窗口关掉再
+    打开仍能看到"正在跑"，也不会起第二个抢同一批文件。
     """
-    global _DL_PROC
-    if _dl_running():
-        return None
     py = Path(sys.executable)
     if py.name.lower() == "pythonw.exe":        # pythonw 没有控制台，换 python.exe
         py = py.with_name("python.exe")
     if not py.exists():
         py = Path(sys.executable)
-    bat = Path(os.environ.get("TEMP", ".")) / f"maisub_dl_{os.getpid()}.bat"
+    bat = Path(os.environ.get("TEMP", ".")) / f"maisub_{tag}_{os.getpid()}.bat"
     lines = [
         "@echo off",
         "chcp 936 >nul",
         f'cd /d "{PROJECT_ROOT}"',
-        "title MaiSubtitle 模型下载",
+        f"title {title}",
         "set PYTHONIOENCODING=gbk:replace",
-        f'"{py}" "scripts\\model_manager.py" download {" ".join(names)}',
+        f'"{py}" "scripts\\{script}" {" ".join(args)}',
         "echo.",
         "if errorlevel 1 goto fail",
-        "echo [完成] 模型已下好：回到 MaiSubtitle 重启一次即生效。",
+        f"echo {done_text}",
         "goto end",
         ":fail",
-        "echo [未完成] 上面就是原因；直接重跑一次即可（支持断点续传）。",
+        f"echo {fail_text}",
         ":end",
         "echo.",
         "pause",
@@ -140,18 +141,52 @@ def _spawn_download_window(names: list) -> "subprocess.Popen | None":
     try:
         bat.write_bytes(("\r\n".join(lines) + "\r\n").encode("gbk", "replace"))
         flags = 0x00000010 if os.name == "nt" else 0     # CREATE_NEW_CONSOLE
-        _DL_PROC = subprocess.Popen(["cmd.exe", "/c", str(bat)],
-                                    cwd=str(PROJECT_ROOT), creationflags=flags)
-        return _DL_PROC
+        return subprocess.Popen(["cmd.exe", "/c", str(bat)],
+                                cwd=str(PROJECT_ROOT), creationflags=flags)
     except Exception as e:
         try:
             with open(PROJECT_ROOT / "logs" / "error.log", "a", encoding="utf-8") as f:
-                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动下载窗口失败: "
+                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动{title}失败: "
                         f"{type(e).__name__}: {e}\n")
         except Exception:
             pass
-        _DL_PROC = None
         return None
+
+
+def _spawn_download_window(names: list) -> "subprocess.Popen | None":
+    """新开命令窗口跑 `model_manager.py download <名字…>`（槽 = _DL_PROC）。"""
+    global _DL_PROC
+    if _dl_running():
+        return None
+    _DL_PROC = _spawn_console_window(
+        "MaiSubtitle 模型下载", "model_manager.py", ["download", *names],
+        "[完成] 模型已下好：回到 MaiSubtitle 重启一次即生效。",
+        "[未完成] 上面就是原因；直接重跑一次即可（支持断点续传）。", "dl")
+    return _DL_PROC
+
+
+def _bench_running() -> bool:
+    """是否有跑分窗口正在跑。"""
+    return _BENCH_PROC is not None and _BENCH_PROC.poll() is None
+
+
+def _spawn_bench_window(langs: str) -> "subprocess.Popen | None":
+    """新开命令窗口跑部署跑分 bench_deploy.py（槽 = _BENCH_PROC）。
+
+    结果三处可看：命令窗口（排名与推荐）、logs/bench_deploy.json（完整）、
+    docs/bench_dev.json（精简对照，随 git 发布给其他用户参考）。
+    """
+    global _BENCH_PROC
+    if _bench_running():
+        return None
+    args = [] if langs == "en,ja,ko,zh" else ["--langs", langs]
+    _BENCH_PROC = _spawn_console_window(
+        "MaiSubtitle 部署跑分", "bench_deploy.py", args,
+        "[完成] 跑分结束：排名与推荐见上；完整数据 logs/bench_deploy.json；"
+        "精简对照 docs/bench_dev.json。",
+        "[未完成] 上面就是原因（多半是显存不够或模型缺失）；"
+        "可用 --langs en,ja --mts qwen 缩小范围重跑。", "bench")
+    return _BENCH_PROC
 
 
 class SettingsDialog(QDialog):
@@ -203,6 +238,23 @@ class SettingsDialog(QDialog):
         self._dl_timer = QTimer(self)
         self._dl_timer.setInterval(1000)
         self._dl_timer.timeout.connect(self._dl_poll)
+        self._dl_active = False          # 下载窗口在跑的标志（_dl_poll 据此收尾）
+        # 「部署跑分」入口（2026-09-18 用户要求）：弹独立 cmd 窗口跑全组合跑分，
+        # 结束后窗口里直接给排名与推荐 —— 用户在自己电脑上部署时照着选搭配。
+        self.btn_bench = QPushButton("部署跑分（帮你选模型搭配）")
+        self.btn_bench.setToolTip(
+            "对 3 种分句 × 2 种识别 × 3 种翻译做全组合实测（4 语种切片）。\n"
+            "耗时约 15~25 分钟、GPU 会跑满；只跑本机已下载的模型。\n"
+            "结束在弹出的命令窗口里看排名与推荐（程序算法，模型自评仅供参考）")
+        self.btn_bench.clicked.connect(self._run_bench)
+        self.lb_bench = QLabel("")
+        self.lb_bench.setWordWrap(True)
+        self.lb_bench.hide()
+        row_bench = QHBoxLayout()
+        row_bench.addWidget(self.btn_bench)
+        row_bench.addWidget(self.lb_bench, 1)
+        lay.addLayout(row_bench)
+        self._bench_active = False       # 跑分窗口在跑的标志
         # 换引擎 / 换 VAD → 状态行立刻跟着变（不用先保存）
         self.cmb_engine.currentIndexChanged.connect(self._refresh_models)
         self.cmb_vad.currentIndexChanged.connect(self._refresh_models)
@@ -232,6 +284,7 @@ class SettingsDialog(QDialog):
     def _tab_asr(self, cfg):
         page = QWidget()
         form = QFormLayout(page)
+        self._form_asr = form          # _sync_backend 靠 labelForField 连标签一起显隐
         form.addRow(_desc("识别引擎与翻译引擎；标「重启生效」的项改完会问你是否立即重启。"))
 
         self.cmb_backend = QComboBox()
@@ -641,21 +694,33 @@ class SettingsDialog(QDialog):
 
     # ---------------- 联动 ----------------
     def _sync_backend(self, *_a):
-        """按识别引擎灰掉无关项，并给出该后端的注意事项。"""
+        """按识别引擎**隐藏**无关项（用户要求：没选中对应后端就不显示那几行），
+        并给出该后端的注意事项。
+
+        ⚠ 只是把不相关字段藏起来，值仍然随 save 一起写回（隐藏 ≠ 清空）——
+        用户切回原后端时之前填的密钥/地址还在。
+        """
         b = self.cmb_backend.currentData() or self.cmb_backend.currentText()
         is_qwen, is_http = b == "qwen3-onnx", b == "http"
         is_ws = b in WS_BACKENDS
-        for w in (self.lb_qwen, self.lb_qwen_state):
-            w.setEnabled(is_qwen)
-        for w in (self.lb_http, self.ed_http, self.lb_http_model, self.ed_http_model):
-            w.setEnabled(is_http)
-        for w in (self.lb_ws_key, self.ed_ws_key, self.lb_ws_model, self.ed_ws_model,
-                  self.lb_ws_app, self.ed_ws_app,
-                  self.lb_ws_acc, self.ed_ws_acc, self.lb_ws_res, self.ed_ws_res,
-                  self.lb_ws_url, self.ed_ws_url,
-                  self.lb_ws_test_row, self.lb_ws_test):
-            w.setEnabled(is_ws)
-        self.lb_ws_note.setVisible(is_ws)
+        form = self._form_asr
+
+        def _show(widgets, on: bool):
+            for w in widgets:
+                w.setVisible(on)
+                # addRow("", w) 这种无标签行要连空 label 一起藏，否则留一行空白
+                lb = form.labelForField(w)
+                if lb is not None:
+                    lb.setVisible(on)
+
+        _show((self.lb_qwen, self.lb_qwen_state), is_qwen)
+        _show((self.lb_http, self.ed_http, self.lb_http_model, self.ed_http_model), is_http)
+        _show((self.lb_ws_key, self.ed_ws_key, self.lb_ws_model, self.ed_ws_model,
+               self.lb_ws_app, self.ed_ws_app,
+               self.lb_ws_acc, self.ed_ws_acc, self.lb_ws_res, self.ed_ws_res,
+               self.lb_ws_url, self.ed_ws_url,
+               self.lb_ws_test_row, self.btn_ws_test, self.lb_ws_test,
+               self.lb_ws_note), is_ws)
         self.btn_ws_test.setEnabled(is_ws and not self._ws_probe.get("running"))
         if is_qwen:
             found = find_qwen_dir(str(getattr(self.cfg, "asr_qwen_dir", "") or ""))
@@ -823,13 +888,22 @@ class SettingsDialog(QDialog):
             self.lb_dl.setStyleSheet("color: #c05a2a;")
             return
         self._refresh_models()
+        self._dl_active = True
         self._dl_timer.start()
 
     def _dl_poll(self):
-        """轮询下载窗口是否结束（进度本身在命令窗口里看）。结束后刷新模型状态。"""
-        if _dl_running():
-            return
-        self._dl_timer.stop()
+        """轮询后台子窗口（下载 / 部署跑分共用一个 1s 定时器），谁结束谁收尾。"""
+        if self._dl_active and not _dl_running():
+            self._dl_active = False
+            self._dl_finish()
+        if self._bench_active and not _bench_running():
+            self._bench_active = False
+            self._bench_finish()
+        if not (self._dl_active or self._bench_active):
+            self._dl_timer.stop()
+
+    def _dl_finish(self):
+        """下载窗口收尾：刷新模型状态与缺失清单（进度本身在命令窗口里看）。"""
         self._refresh_models()
         from . import selfcheck
         left = selfcheck.missing_downloads(self.cfg, **self._model_kw())
@@ -841,6 +915,42 @@ class SettingsDialog(QDialog):
             self.lb_dl.setText(f"下载窗口已结束，但仍缺 {len(left)} 项："
                                "看那个窗口里的报错；重跑一次可断点续传")
             self.lb_dl.setStyleSheet("color: #c05a2a;")
+
+    def _bench_finish(self):
+        """跑分窗口收尾：按钮恢复，指路结果文件。"""
+        self.btn_bench.setEnabled(True)
+        self.lb_bench.setVisible(True)
+        self.lb_bench.setText("跑分结束：排名与推荐在那个命令窗口里；完整数据 "
+                              "logs/bench_deploy.json，精简对照 docs/bench_dev.json")
+        self.lb_bench.setStyleSheet("color: #4a8a4a;")
+
+    def _run_bench(self):
+        """「部署跑分」入口：确认后弹独立 cmd 窗口跑全组合跑分（GPU 会跑满）。"""
+        if _bench_running():
+            return
+        ret = QMessageBox.question(
+            self, "开始部署跑分？",
+            "对 3 种分句 × 2 种识别 × 3 种翻译做全组合实测（4 语种切片）。\n\n"
+            "· 耗时约 15~25 分钟，期间 GPU 会跑满（要打游戏/直播就先缓缓）\n"
+            "· 只跑本机已下载的模型；缺什么命令窗口里会写明怎么补\n"
+            "· 结束后窗口里直接给排名与推荐（程序算法；模型自评仅供参考）\n"
+            "· 完整数据 logs/bench_deploy.json；精简对照 docs/bench_dev.json\n\n"
+            "现在开始？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        if _spawn_bench_window("en,ja,ko,zh") is None:
+            self.lb_bench.setVisible(True)
+            self.lb_bench.setText("启动跑分窗口失败：详见 logs/error.log；也可以手动跑 "
+                                  "python scripts/bench_deploy.py")
+            self.lb_bench.setStyleSheet("color: #c05a2a;")
+            return
+        self._bench_active = True
+        self.btn_bench.setEnabled(False)
+        self.lb_bench.setVisible(True)
+        self.lb_bench.setText("跑分进行中…（进度与排名在那个命令窗口里，结束后这里会提示）")
+        self.lb_bench.setStyleSheet("color: #d08a2a;")
+        self._dl_timer.start()
 
     def _sync_vad(self):
         fr = self.cmb_vad.currentText() == "firered"
