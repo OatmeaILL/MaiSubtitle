@@ -116,9 +116,10 @@ GPU 跑满。
 
 ![综合分排名](docs/bench_rank.svg)
 
-- 最优搭配 silero + whisper + qwen（综合 83.1）；最快 silero + qwen3-asr + qwen（体感 3.8s）。
-- 延迟的大头是等一句话说完（段长），识别本身只占 0.2~0.4s/段。
-- 翻译：qwen 约 0.16s/句；hymt2 质量打分最高但约 0.6~0.8s/句。
+- 最优搭配 silero + whisper + qwen（综合 83.1，与升级前一致）；最快 silero + qwen3-asr + qwen（体感 3.9s）。
+- 延迟的大头是等一句话说完（段长），识别本身只占 0.3~0.4s/段。
+- 翻译：qwen 约 0.17s/句；hymt2 质量打分最高但约 0.6~0.8s/句。
+- 2026-09-20 大升级后重测：排名与升级前完全一致，无性能回归。
 
 ![延迟构成](docs/bench_latency.svg)
 
