@@ -1,6 +1,7 @@
 """术语库：词条/别名/模糊匹配/热更新/命中日志/CSV+JSON。"""
 import csv
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -102,12 +103,14 @@ class Glossary:
                     self._index[key] = t
 
     def save(self):
+        # 原子写（同 config.save）：写一半被杀不留截断文件
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         if self.path.suffix == ".json":
-            self.path.write_text(json.dumps([asdict(t) for t in self.terms],
-                                            ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps([asdict(t) for t in self.terms],
+                                      ensure_ascii=False, indent=2), encoding="utf-8")
         else:
-            with open(self.path, "w", newline="", encoding="utf-8-sig") as f:
+            with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 w.writerow(["src_lang", "source", "aliases", "target_zh",
                             "force", "priority", "note", "use"])
@@ -115,6 +118,7 @@ class Glossary:
                     w.writerow([term.src_lang, term.source, "|".join(term.aliases),
                                 term.target_zh, term.force, term.priority,
                                 term.note, term.use])
+        os.replace(tmp, self.path)
         self._mtime = self.path.stat().st_mtime
 
     def check_reload(self) -> bool:

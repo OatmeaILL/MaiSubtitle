@@ -163,6 +163,7 @@ def main():
         log(f"已启动 live_demo（pid={child.pid}）")
         started = time.time()
         seen_hb = False
+        none_streak = 0          # 心跳文件连续读不到的次数（进入监控后按卡死处理）
         while True:
             time.sleep(2)
             if child.poll() is not None:
@@ -192,7 +193,18 @@ def main():
                     log(f"超过 {GRACE:.0f}s 仍无心跳，判定启动异常 → 重启")
                     _kill(child)
                     break
+                if seen_hb:
+                    # 以前这里直接 continue：进入监控后心跳文件被删/读失败
+                    #（日志清理、磁盘错误）会让卡死检测**永久失效**——恰恰放过
+                    # 本守护进程要兜的"GPU 原生卡死"。连续 3 次读不到按卡死处理。
+                    none_streak += 1
+                    if none_streak >= 3:
+                        log(f"心跳连续 {none_streak} 次读不到（文件被删/磁盘错误？）"
+                            "→ 按卡死处理，杀掉重启")
+                        _kill(child)
+                        break
                 continue
+            none_streak = 0
             if not seen_hb:
                 seen_hb = True
                 log("已收到心跳，进入监控")

@@ -25,9 +25,14 @@ speech_ratio（音乐门要用）：FSMN 只给段边界、不给逐帧概率，
 """
 from __future__ import annotations
 
+import sys
+import time
+
 import numpy as np
 
 from .vad import FRAME_SIZE, SAMPLE_RATE, SileroVAD
+
+_last_feed_err = [0.0]    # 单块识别失败的限频报告（喂音频是持续流，别刷屏）
 
 # 毫秒 → 样本（16k 采样率下 1ms = 16 样本）
 _MS2S = SAMPLE_RATE // 1000
@@ -108,7 +113,14 @@ class FsmnSegmenter:
         try:
             res = self._model((pcm.astype(np.float32) / 32768.0),
                               param_dict=self._params)
-        except Exception:
+        except Exception as e:
+            # 单块出错不应打断采集循环 —— 但也不能零留证：模型目录坏/输入形状不符时
+            # 表现就是"永远不切句、字幕全无"而日志一个字都没有（假成功类坑）。
+            now = time.time()
+            if now - _last_feed_err[0] > 30.0:
+                _last_feed_err[0] = now
+                print(f"[vad-fsmn] 单块识别失败（30s 内只报这一次，采集继续）："
+                      f"{type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
             return []                     # 单块出错不应打断采集循环
 
         out: list[dict] = []

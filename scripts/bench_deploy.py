@@ -148,10 +148,10 @@ def print_models():
                             ("翻译", ok_mt, miss_mt)):
         print(f"[{title}]")
         for key, dl, label, mb in ok:
-            print(f"  ✔ {label:26s} {mb:7.0f} MB")
+            print(f"  [OK] {label:26s} {mb:7.0f} MB")
         for key, dl, label, mb in miss:
             hint = CATALOG.get(dl, ("", "", "", False))[0]
-            print(f"  ✘ {label:26s} 未下载 → python scripts/model_manager.py download {key}")
+            print(f"  [缺] {label:26s} 未下载 → python scripts/model_manager.py download {key}")
             if hint in ("__local__",):
                 print("       （该项需按 model_manager list 的手动步骤自备）")
         print()
@@ -221,6 +221,18 @@ def pct(values, p: float) -> float:
 
 def has_cjk(t: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in (t or ""))
+
+
+
+def _gpu_name() -> str:
+    """当前机器的 GPU 型号（写进跑分结果；以前写死 RTX 4060，别家机器跑分就标错）。"""
+    try:
+        _r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                             "--format=csv,noheader"], capture_output=True,
+                            text=True, timeout=10)
+        return (_r.stdout or "").strip() or "未知 GPU"
+    except Exception:
+        return "未知 GPU"
 
 
 def zh_ratio(texts) -> float:
@@ -482,8 +494,17 @@ def run_child(args) -> int:
                     pairs.append((t, (zh or "").strip()))
                 ls, extra = line_score(c["ref"], texts)
                 acc = char_acc(c["ref"], texts) if c["ref"] else 0.0
-                e2e = [a + m for a, m in zip(asr_ms, mt_ms)]
-                onset = [l + e for l, e in zip(seg_lens, e2e)]
+                # e2e/onset 只对"有识别输出"的段累计：asr_ms/seg_lens 是**每段**
+                # 一条（含空段），mt_ms 只对非空段计时 —— 直接 zip 会在有空段时
+                # 截断且错位（第 k 段的识别耗时配上第 k 个非空段的翻译耗时）
+                e2e, onset = [], []
+                _j = 0
+                for _i, _t in enumerate(texts):
+                    if not _t:
+                        continue
+                    e2e.append(asr_ms[_i] + mt_ms[_j])
+                    onset.append(seg_lens[_i] + asr_ms[_i] + mt_ms[_j])
+                    _j += 1
                 info = {
                     "ref_n": len(c["ref"]), "hyp_n": len([t for t in texts if t]),
                     "line_score": round(ls, 1) if c["ref"] else None,
@@ -733,24 +754,35 @@ def write_ref_result(rows, langs, failed):
                       for lg, v in r["langs"].items()},
         })
     doc = {
-        "note": "开发机（RTX 4060 Laptop 8GB）部署跑分结果，供你自己跑分后对照参考。"
-                "跑法：python scripts/bench_deploy.py；切片 testdata/_clip_*.wav。"
-                "onset = 段长 + 识别 + 翻译（体感延迟）；judge = 翻译模型自评（仅供参考）。",
-        "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU (8GB)",
+        "note": "本机部署跑分结果（供对照参考）。跑法：python scripts/bench_deploy.py；"
+                "切片 testdata/_clip_*.wav。onset = 段长 + 识别 + 翻译（体感延迟）；"
+                "judge = 翻译模型自评（仅供参考）。",
+        "gpu": _gpu_name(),
         "clip_sources": {"en": "BBC Real Easy English 播客（参考文本=火山识别整理）",
                           "ja": "TTS 逐句拼接（参考文本=逐句原文）",
                           "ko": "韩语游戏解说（参考文本=火山+whisper 双源共识）",
                           "zh": "TTS 逐句拼接（参考文本=逐句原文）"},
         "clips": langs, "failed_children": failed, "rows": slim_rows,
     }
-    try:
-        dst = ROOT / "docs" / "bench_dev.json"
-        if (ROOT / "docs").is_dir():
+    # 只在**开发仓**（docs/dev 存在）才覆写随 git 发布的参考结果 docs/bench_dev.json：
+    # 以前任何副本跑一次跑分都会用自己的数据静默覆盖"开发机参考值"（GPU 型号还是
+    # 写死的 RTX 4060）—— 对照数据变成张冠李戴。用户副本一律写 logs/（不进 git）。
+    if (ROOT / "docs" / "dev").is_dir():
+        try:
+            dst = ROOT / "docs" / "bench_dev.json"
             dst.write_text(json.dumps(doc, ensure_ascii=False, indent=1),
                            encoding="utf-8")
             print(f"精简参考结果已写入 {dst}（随 git 发布，用户跑分后可对照）")
-    except OSError as e:
-        print(f"[注意] 参考结果没写成（不影响跑分）：{e}")
+        except OSError as e:
+            print(f"[注意] 参考结果没写成（不影响跑分）：{e}")
+    else:
+        try:
+            dst = ROOT / "logs" / "bench_deploy_result.json"
+            dst.write_text(json.dumps(doc, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            print(f"跑分结果已写入 {dst}")
+        except OSError as e:
+            print(f"[注意] 结果没写成（不影响跑分）：{e}")
 
 
 def print_results(rows, langs, args):

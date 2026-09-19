@@ -2,7 +2,7 @@
 #
 # 怎么装：**双击 安装_首次使用.bat**（推荐）；手动装见 README「手动安装」。
 #   本文件是"能一把装上的那些"，命令：
-#       .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+#       .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple/
 #   ⚠ 但**只有这一条还不够**：下面末尾有两个包必须单独装，装法见文件末尾。
 
 # --- 界面 / 系统 ---
@@ -71,8 +71,10 @@ websocket-client==1.9.2     # 仅「火山引擎流式识别（WebSocket）」�
 #    它的依赖里只有 jieba 是上面没有的，一并补。
 #
 # 正确装法（scripts/setup_first_run.py 里自动做，也就是安装器的"[2/5] 单独装"那步）：
-#   .venv\Scripts\python.exe -m pip install --no-deps -i https://mirrors.aliyun.com/pypi/simple/ faster-whisper==1.2.1
-#   .venv\Scripts\python.exe -m pip install --no-deps -i https://mirrors.aliyun.com/pypi/simple/ funasr-onnx==0.4.3 jieba
+# （源用清华：实测同一只 wheel 阿里云 0.2 vs 清华 24 MB/s，torch 2.5GB 差 3 小时；
+#   安装器会自动测速选源，手动装直接用清华/中科大即可）
+#   .venv\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple/ faster-whisper==1.2.1
+#   .venv\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple/ funasr-onnx==0.4.3 jieba
 # （用 uv 建的环境没有 pip，把上面两条的 ".venv\Scripts\python.exe -m pip install" 换成
 #   "uv pip install --python .venv\Scripts\python.exe"，并把 -i 写成 --index-url）
 # ============================================================================

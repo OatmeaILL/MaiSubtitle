@@ -46,6 +46,17 @@ class DisplayQueue:
         self.dropped = 0               # 统计：因积压被丢掉的句数
 
     # ---------------- 入队 ----------------
+    def set_dwell_ms(self, dwell_ms: float, settle_grace_ms: float | None = None):
+        """运行期改"每句最少停留"（设置保存后立即生效，无需重启）。
+
+        派生量（settle_grace_s / max_hold_s）与 __init__ 保持同一口径：
+        settle 默认 = 半个 dwell，max_hold = dwell + settle。
+        """
+        self.dwell_s = max(0.0, float(dwell_ms) / 1000.0)
+        self.settle_grace_s = (self.dwell_s * 0.5 if settle_grace_ms is None
+                               else max(0.0, float(settle_grace_ms) / 1000.0))
+        self.max_hold_s = self.dwell_s + self.settle_grace_s
+
     def push(self, cid, src: str, dst, lang: str, now: float):
         """投递一条字幕。
 

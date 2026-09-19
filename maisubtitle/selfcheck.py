@@ -82,22 +82,27 @@ def _ws_has_key(cfg) -> bool:
 
 def _mt_state(cfg, engine: str | None = None) -> tuple[bool, str]:
     """翻译引擎状态；**回落时明确指出"实际用哪个"**（否则 hymt2 后面跟着 Qwen 目录会误导）。"""
-    eng = str(engine or getattr(cfg, "engine", "qwen") or "qwen").strip().lower()
-    cands = ENGINE_CANDIDATES.get(eng, ENGINE_CANDIDATES["qwen"])
+    eng = str(engine or getattr(cfg, "engine", "hymt2") or "hymt2").strip().lower()
+    cands = ENGINE_CANDIDATES.get(eng, ENGINE_CANDIDATES["hymt2"])
     for i, (d, marker) in enumerate(cands):
         if (MODELS_DIR / d / marker).exists():
             if i == 0:
                 return True, f"翻译 {eng}（{d}）"
-            return True, f"翻译 {eng}（权重未装 → 实际回落 {d}）"
+            return True, f"翻译 {eng}（首选没装 → 实际用 {d}）"
     return False, f"翻译 {eng}（{cands[0][0]} 未找到 → 本次只出原文）"
 
 
 def summary(cfg, engine: str | None = None, backend: str | None = None,
             vad: str | None = None) -> list[str]:
-    """给日志/设置窗口用的一行行状态（✔/✘ + 名称）。"""
+    """给日志/设置窗口用的一行行状态（[OK]/[缺] + 名称）。
+
+    标记用 ASCII（[OK]/[缺]）：这个字符串会被 live_demo 打进控制台，而 GBK
+    控制台打不出对勾/叉类符号 —— 输出被重定向（无 PYTHONIOENCODING 保护）时会
+    直接 UnicodeEncodeError。本模块全文禁止出现这类字符（护栏看管）。
+    """
     out = []
     for ok, name in (_asr_state(cfg, backend), _mt_state(cfg, engine), _vad_state(cfg, vad)):
-        out.append(f"{'✔' if ok else '✘'} {name}")
+        out.append(f"{'[OK]' if ok else '[缺]'} {name}")
     return out
 
 
@@ -155,10 +160,10 @@ def check(cfg, engine: str | None = None, backend: str | None = None,
                         "--only whisper_turbo")
     mt_ok, mt_name = _mt_state(cfg, engine)
     if not mt_ok:
-        msgs.append(mt_name + "；补救：python scripts/download_models.py --only qwen_1_5b_hf，"
+        msgs.append(mt_name + "；修复：python scripts/download_models.py --only qwen_1_5b_hf，"
                     "再 python scripts/model_manager.py convert qwen_1_5b")
     vad_ok, vad_name = _vad_state(cfg, vad)
     if not vad_ok:
-        msgs.append(f"缺 {vad_name} 模型（将自动回落其它 VAD）→ "
-                    "python scripts/model_manager.py list 查看补救方式")
+        msgs.append(f"缺 {vad_name} 模型（会自动改用其它 VAD）→ "
+                    "python scripts/model_manager.py list 查看怎么补")
     return msgs

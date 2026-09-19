@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
+import soxr                      # libsoxr 的 Python 绑定（重采样；drain 流式路径也用）
 
 TARGET_SR = 16000
 
@@ -44,11 +45,12 @@ class LoopbackCapture:
         self.device_index = device_index
         self._frames = []
         self._lock = threading.Lock()
-        self._n_samples_device = 0
         self._t_start = None
         self._stream = None
         self._overflow_count = 0
         self._device_info = None
+        self._rs = None                    # 有状态流式重采样器（见 start）
+        self._rs_key = None
 
     def start(self):
         info = (self.pa.get_device_info_by_index(self.device_index)
@@ -57,13 +59,14 @@ class LoopbackCapture:
         channels = min(info["maxInputChannels"], 2)
         sr = int(info["defaultSampleRate"])
         self._t_start = time.perf_counter()
+        self._rs = None                    # 设备热切换重建 cap 时自然重建
+        self._rs_key = None
 
         def cb(in_data, frame_count, time_info, status):
             if status:
                 self._overflow_count += 1
             with self._lock:
                 self._frames.append(np.frombuffer(in_data, dtype=np.int16).copy())
-                self._n_samples_device += frame_count
             return (None, pyaudio.paContinue)
 
         self._stream = self.pa.open(
@@ -99,6 +102,15 @@ class LoopbackCapture:
     def device_name(self) -> str:
         return self._device_info["name"]
 
+    def discard(self):
+        """清空积压但**不**拼接/重采样（暂停时用：音频反正要扔，别白算）。
+
+        drain() 对积压会做 concatenate + HQ 重采样；暂停期间每 100ms 白跑一次
+        实时速率的重采样纯属浪费 —— 这里只清队列。
+        """
+        with self._lock:
+            self._frames = []
+
     def drain(self) -> np.ndarray:
         """取出并清空自上次调用以来累积的 16k 单声道样本（音频流保持打开）。
 
@@ -113,7 +125,34 @@ class LoopbackCapture:
         raw = np.concatenate(frames)
         sr_dev = int(self._device_info["defaultSampleRate"])
         ch = min(self._device_info["maxInputChannels"], 2)
-        return to_16k_mono(raw, sr_dev, ch)
+        # 有状态流式重采样（§八十二）：以前每 100ms 对独立小块调一次**无状态**
+        # soxr.resample，滤波器尾在块边界不连续（每秒 ~10 个边界伪迹——whisper
+        # 在短窗上触发复读幻觉的典型诱因之一）。失配/不支持时回落无状态路径。
+        x = raw.astype(np.float32) / 32768.0
+        if ch > 1:
+            x = x.reshape(-1, ch).mean(axis=1)
+        if sr_dev == TARGET_SR:
+            return np.clip(x * 32767.0, -32768, 32767).astype(np.int16)
+        key = (sr_dev, ch)
+        if self._rs_key != key:
+            self._rs = None
+            try:
+                self._rs = soxr.ResampleStream(sr_dev, TARGET_SR, 1, quality="HQ")
+            except Exception:
+                try:
+                    self._rs = soxr.ResampleStream(sr_dev, TARGET_SR, 1)
+                except Exception:
+                    self._rs = None        # 该环境没有流式 API → 无状态兜底
+            self._rs_key = key
+        if self._rs is not None:
+            try:
+                x = self._rs.resample_chunk(x)
+            except Exception:
+                self._rs = None            # 本块失败：回落并重建流
+                x = soxr.resample(x, sr_dev, TARGET_SR, quality="HQ")
+        else:
+            x = soxr.resample(x, sr_dev, TARGET_SR, quality="HQ")
+        return np.clip(x * 32767.0, -32768, 32767).astype(np.int16)
 
 
 import time  # noqa: E402

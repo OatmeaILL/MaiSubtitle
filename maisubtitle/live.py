@@ -591,6 +591,10 @@ class LivePipeline:
         self._pause = threading.Event()
         self._worker = None
         self.latencies: list[float] = []
+        # 字幕上屏口径的端到端延迟（含翻译/上屏排队）——latencies 只记到原文定稿，
+        # 系统性低估 163~800ms（§八十二：计量要真，两个口径都留）
+        self.latencies_display: list[float] = []
+        self._offset_timers: list = []
         self.session_cues: list[dict] = []
         self._cue_index: dict = {}       # cid → session_cues 下标（续接时原地更新）
         self._t0 = time.perf_counter()
@@ -600,6 +604,19 @@ class LivePipeline:
         self.stats = {"segments": 0, "translations": 0, "errors": 0}
         self._mt_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self._mt = None
+        # 显示模式/渐进显示的**运行期单元格**：F11、设置保存后即时生效（管线每段读取）。
+        # 以前是 _run 启动时一次性快照 —— "仅原文"启动后按 F11 切回双语，
+        # 界面出现译文列但管线根本不翻译，译文永远是空且无任何报错。
+        dm = getattr(self.cfg, "display_mode", "bilingual")
+        if dm not in ("bilingual", "target", "source"):
+            dm = "bilingual"
+        self._rt_mode = {
+            "mode": dm,
+            "need_translation": dm != "source",
+            "progressive": (bool(getattr(self.cfg, "progressive_display", True))
+                            and dm in ("bilingual", "source")),
+            "stream": bool(getattr(self.cfg, "stream_translation", True)),
+        }
 
     # ---- 生命周期 ----
     def start(self):
@@ -618,8 +635,27 @@ class LivePipeline:
         self._src_ctx_clear = True
         return self._forced_lang
 
+    def set_stream_translation(self, on: bool):
+        """运行期开关流式翻译（译文逐 token 长出 vs 整句一次出现）。"""
+        self._rt_mode["stream"] = bool(on)
+
+    def set_display_mode(self, mode: str):
+        """运行期切换显示模式（F11 / 设置保存后调用）。
+
+        仅原文 = 管线不翻译（省 GPU）；切回双语/仅译文时下一句起恢复翻译。
+        """
+        mode = mode if mode in ("bilingual", "target", "source") else "bilingual"
+        self._rt_mode["mode"] = mode
+        self._rt_mode["need_translation"] = mode != "source"
+        self._rt_mode["progressive"] = (
+            bool(getattr(self.cfg, "progressive_display", True))
+            and mode in ("bilingual", "source"))
+        return mode
+
     def stop(self):
         self._stop.set()
+        for t in getattr(self, "_offset_timers", []):
+            t.cancel()
         if self._worker:
             self._worker.join(timeout=15)
 
@@ -645,8 +681,18 @@ class LivePipeline:
             return {"n": 0}
         import numpy as np
         a = np.array(self.latencies)
-        return {"n": len(a), "median_ms": round(float(np.median(a))),
-                "p95_ms": round(float(np.percentile(a, 95))), "max_ms": round(float(a.max()))}
+        out = {"n": len(a), "median_ms": round(float(np.median(a))),
+               "p95_ms": round(float(np.percentile(a, 95))), "max_ms": round(float(a.max()))}
+        if self.latencies_display:
+            d = np.array(self.latencies_display)
+            out["display"] = {"n": len(d), "median_ms": round(float(np.median(d))),
+                              "p95_ms": round(float(np.percentile(d, 95))),
+                              "max_ms": round(float(d.max()))}
+        n_tr = self.stats.get("translations", 0)
+        if n_tr:
+            out["mt_cache_hit_rate"] = round(
+                self.stats.get("mt_cache_hit", 0) / n_tr, 3)
+        return out
 
     def export_session(self, path: str, bilingual: bool = True) -> int:
         """导出本次会话字幕为 SRT（阶段3 导出热键）。返回 cue 数。"""
@@ -660,17 +706,24 @@ class LivePipeline:
     def enforce_log_quota(max_mb: int):
         """阶段5：logs/ 总量限额，超限删最旧文件。"""
         from .config import LOGS_DIR
-        files = sorted(LOGS_DIR.glob("*"), key=lambda p: p.stat().st_mtime if p.is_file() else 0)
-        total = sum(p.stat().st_size for p in files if p.is_file()) / 1024 / 1024
+        entries = []
+        for p in LOGS_DIR.glob("*"):
+            if not p.is_file():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue      # glob 与 stat 之间被删（外部清理/杀软）：跳过，别让启动失败
+            entries.append((st.st_mtime, st.st_size, p))
+        entries.sort(key=lambda e: e[0])
+        total = sum(s for _, s, _ in entries) / 1024 / 1024
         i = 0
-        while total > max_mb and i < len(files):
-            f = files[i]
-            if f.is_file():
-                total -= f.stat().st_size / 1024 / 1024
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
+        while total > max_mb and i < len(entries):
+            try:
+                entries[i][2].unlink()
+            except OSError:
+                pass
+            total -= entries[i][1] / 1024 / 1024   # 按预期大小扣：删不掉也别死循环
             i += 1
 
     def _run(self):
@@ -801,7 +854,7 @@ class LivePipeline:
         t_warm = time.perf_counter()
         try:
             whisper.transcribe(np.zeros(16000, dtype=np.int16), language="en",
-                               beam_size=1)
+                               beam_size=1, without_timestamps=True)
             if hasattr(mt, "translate"):
                 mt.translate("ok", "en", context=[])
             self.on_state(f"预热完成 {time.perf_counter() - t_warm:.1f}s")
@@ -843,21 +896,13 @@ class LivePipeline:
         # 250ms 节拍 258ms → 100ms 节拍 176ms → 50ms 节拍 161ms；
         # 节拍只影响调用次数不影响 VAD 总帧数，所以 CPU 基本不变，取 100ms。
         tick_s = max(0.05, getattr(cfg, "loop_tick_ms", 100) / 1000.0)
-        progressive = bool(getattr(cfg, "progressive_display", True))
-        # 显示模式：bilingual 双语 / target 仅译文 / source 仅原文
-        display_mode = getattr(cfg, "display_mode", "bilingual")
-        if display_mode not in ("bilingual", "target", "source"):
-            display_mode = "bilingual"
+        # 显示模式/渐进显示：从**运行期单元格**读（F11 / 设置保存后即时生效）。
         # 仅原文模式不做翻译——省掉整段翻译的开销
-        need_translation = display_mode != "source"
-        # 渐进显示只在"当前行会显示原文"时才有意义（双语 / 仅原文）
-        progressive = progressive and display_mode in ("bilingual", "source")
         # 实时模式：边说边做部分识别；sentence 模式：整句说完才识别一次
         realtime = str(getattr(cfg, "stream_mode", "realtime")) == "realtime"
         partial_interval_s = max(0.3, getattr(cfg, "partial_interval_ms", 700) / 1000.0)
         partial_min_s = float(getattr(cfg, "partial_min_s", 0.8) or 0.8)
-        # 流式翻译：译文边生成边上屏（仅 CT2 引擎支持，其他实现自动回落整段翻译）
-        use_stream = bool(getattr(cfg, "stream_translation", True))
+        # 流式翻译开关在运行期单元格（设置保存后即时生效，见 _rt_mode）
         cap = audio.LoopbackCapture().start()   # 音频流持续打开，循环内只 drain 不重建
         cur_device = cap.device_name
         probe_pa = None                          # 复用的探测用 PyAudio
@@ -898,12 +943,19 @@ class LivePipeline:
                 self.session_cues[idx] = cue
 
             def emit():
+                if self._stop.is_set():
+                    return      # 退出后排程的 Timer 不再打进已拆掉的显示层
                 self.on_subtitle(cid, src_text, dst, lang, round(lat_ms))
 
             offset_ms = int(getattr(cfg, "display_offset_ms", 0) or 0)
             if offset_ms > 0:
-                # 阶段5：蓝牙等外设延迟补偿（显示延后，不打进延迟统计）
-                threading.Timer(offset_ms / 1000, emit).start()
+                # 阶段5：蓝牙等外设延迟补偿（显示延后，不打进延迟统计）。
+                # 句柄要记下来、退出时 cancel —— 以前每句起一次性线程且不取消，
+                # 退出期已排程的回调会带着闭包打进已 teardown 的 UI（偶发崩溃）。
+                _t = threading.Timer(offset_ms / 1000, emit)
+                _t.daemon = True
+                self._offset_timers.append(_t)
+                _t.start()
             else:
                 emit()
 
@@ -920,12 +972,13 @@ class LivePipeline:
             用户反馈"流式模式用起来很难受"——所以他把流式关了（stream_mode=sentence）。
             """
             _force = getattr(self, "_forced_lang", None)
-            if (_force is None and lang_lock is None) or display_mode == "target":
+            if (_force is None and lang_lock is None)                     or self._rt_mode["mode"] == "target":
                 return                       # 还没定语言 / 仅译文模式：先不显示半成品
             try:
                 t0 = time.perf_counter()
                 text, _ = whisper.transcribe(piece, language=_force or lang_lock,
-                                             beam_size=1)
+                                             beam_size=1, without_timestamps=True,
+                                             no_fallback=True)
                 cost_ms = round((time.perf_counter() - t0) * 1000)
             except Exception:
                 return
@@ -1008,7 +1061,8 @@ class LivePipeline:
             text, _meta = whisper.transcribe(pre_pcm if pre_pcm is not None else piece,
                                              language=lang, prompt=prompt,
                                              return_confidence=True,
-                                             beam_size=getattr(cfg, "beam_size", 5))
+                                             beam_size=getattr(cfg, "beam_size", 5),
+                                             without_timestamps=True)
             text = text.strip()
 
             def _drop(counter: str):
@@ -1110,12 +1164,25 @@ class LivePipeline:
                     src_text = fixed
                     self.stats["asr_term_fix"] = (self.stats.get("asr_term_fix", 0)
                                                   + len(ghits))
+            # ---- 半句续接候选（**先算**，§八十二）：合并行跳过 punct_final ——
+            # 合并后接缝处有专门的 seam punct 管标点，先花 0.3~0.5s 给即将被合并的
+            # 碎片补标点纯属浪费。被否决（veto）的合并行照常补标点。
+            # merge_max_chars 用的是未补标点的文本，字数差标点级、边界影响可忽略。
+            raw_prev = _merge_continuation(tail, lang, seg_end_wall, src_text,
+                                           merge_gap_s, merge_max_chars)
+            merge_vetoed = False
+            if raw_prev is not None and pre_pcm is not None and not overlap_ok:
+                # 前卷解码里没出现上一行的词 → 两段不是接着说的（模型听到的是
+                # 另一段话）→ 不合并，否则屏幕上会出现重复内容
+                merge_vetoed = True
+                self.stats["merge_veto"] = self.stats.get("merge_veto", 0) + 1
+            prev_text = None if merge_vetoed else raw_prev
             # ---- 定稿补标点（punct_final）----
             # 放在这里（而不是上屏前）是有意的：补出来的句读随后会参与
             #   ① 半句续接判定（接缝有没有句末标点）② _split_long 的按句切分
             # —— 有了句读，长段才可能切在真正的句子边界上，而不是靠字数硬猜。
             # 时间如实计进延迟（这次调用确实推后了上屏，不粉饰）。
-            if punct_final:
+            if punct_final and prev_text is None:
                 _t_pf = time.perf_counter()
                 _pf = _punct_final_line(mt, src_text, engine=punct_engine,
                                         cpu_dir=punct_cpu_dir,
@@ -1139,13 +1206,6 @@ class LivePipeline:
             # shows" 被重切成 "…hero plays,"，屏幕上的字往回缩）。
             # 只追加、不改写已有内容，才叫 append-and-correct；长度由
             # _merge_continuation 的 max_chars 把关。
-            prev_text = _merge_continuation(tail, lang, seg_end_wall, src_text,
-                                            merge_gap_s, merge_max_chars)
-            if prev_text is not None and pre_pcm is not None and not overlap_ok:
-                # 前卷解码里没出现上一行的词 → 两段不是接着说的（模型听到的是
-                # 另一段话）→ 不合并，否则屏幕上会出现重复内容
-                prev_text = None
-                self.stats["merge_veto"] = self.stats.get("merge_veto", 0) + 1
             # ---- 接缝标点判定：该合还是该分，看模型给不给句读 ----
             # 旧行为是"撞上限被切 + 6s 内 → 无条件拼成一行"，它不认识句子边界：
             # 上半句其实已经说完了（"…and jinjou."）也会被硬粘上下一句。
@@ -1174,6 +1234,10 @@ class LivePipeline:
                     self.stats["seam_skip"] = self.stats.get("seam_skip", 0) + 1
             if prev_text is not None:
                 src_text = f"{prev_text} {src_text}".strip()
+                # 本段说话期间的"部分识别"半句可能已上屏（cid=本段 seg_id）；
+                # 定稿既然并进上一行（tail 的 cid），那半句要撤掉 —— 否则它永远
+                # 停在半截原文、没有译文，还与合并后的整句内容重复（孤儿残句）。
+                self.on_drop(cid)
                 cid = tail["cid"]
                 parts = [src_text]
                 merged_line = True       # 本行是上一行的延长（半句续接）
@@ -1198,7 +1262,7 @@ class LivePipeline:
                 part_dur = dur / n
                 part_end = seg_end_wall - (n - 1 - i) * part_dur
                 # 识别刚出、译文还没好：先把原文推给悬浮窗，感知延迟直接砍半
-                if progressive and lang in TRANSLATABLE:
+                if self._rt_mode["progressive"] and lang in TRANSLATABLE:
                     self.on_partial(sub_cid, part, lang, round(lat_ms))
                 dst = ""
                 cache_hit = False
@@ -1212,18 +1276,22 @@ class LivePipeline:
                 ctx_mt = list(context)
                 if merged_line and ctx_mt:
                     ctx_mt = ctx_mt[:-1]
-                if lang in TRANSLATABLE and need_translation:
+                if lang in TRANSLATABLE and self._rt_mode["need_translation"]:
                     # 重复句缓存：同一句（120s 内）直接复用译文，跳过整次生成
                     hit = self._mt_cache.get(cache_key)
                     if hit and time.time() - hit[0] < 120.0:
                         dst = hit[1]
                         cache_hit = True
                         self.stats["mt_cache_hit"] = self.stats.get("mt_cache_hit", 0) + 1
+                        self._mt_cache[cache_key] = self._mt_cache.pop(cache_key)
+                        # 命中即刷新为"最近使用"：以前按插入序淘汰，游戏高频台词
+                        # 这类热句会被冷句挤出去
                         self.on_translation_update(sub_cid, part, dst, lang)
                         context.append(dst)
                     else:
                         self.on_activity("翻译中…")
-                if lang in TRANSLATABLE and need_translation and not cache_hit:
+                if (lang in TRANSLATABLE
+                        and self._rt_mode["need_translation"] and not cache_hit):
                     # 术语表**只给本句真正出现的术语**：
                     # 整张表会让小模型把没出现的词也硬塞进译文
                     # （实测：句中没有 rover，整表时译文也会冒出"漂泊者"）。
@@ -1234,7 +1302,8 @@ class LivePipeline:
                     if glossary:
                         canonical, hits = glossary.canonicalize(part, lang)
                     # 流式翻译：译文逐 token 增长，边生成边上屏（仅 CT2 引擎支持）
-                    if (use_stream and hasattr(mt, "translate_stream")):
+                    if (self._rt_mode["stream"]
+                            and hasattr(mt, "translate_stream")):
                         for partial in mt.translate_stream(canonical, lang,
                                                            context=ctx_mt):
                             dst = to_simplified(partial)
@@ -1330,6 +1399,8 @@ class LivePipeline:
                     part = to_simplified(part)   # 中文语音原文繁体→简体
                 _emit_cue(sub_cid, part, dst, lang,
                           part_end - self._t0, part_dur, lat_ms)
+                self.latencies_display.append(
+                    (time.perf_counter() - seg_end_wall) * 1000)
             # 本段处理完毕：收掉"识别中…"转圈。只在 need_translation 为假时才会
             # 漏掉这一步（仅原文模式跑完 ASR 后直接 _emit_cue）—— 漏掉的话活动
             # 提示永远停在那里，10s 后被悬浮窗当"卡死"清掉，日志里就是
@@ -1433,7 +1504,7 @@ class LivePipeline:
             while not self._stop.is_set():
                 time.sleep(tick_s)
                 if self._pause.is_set():
-                    cap.drain()          # 暂停期间丢弃音频，避免恢复时堆积
+                    cap.discard()        # 暂停期间丢弃音频（不拼接/不重采样），避免恢复时堆积
                     continue
                 audio16k = cap.drain()
                 wall_now = time.perf_counter()
@@ -1443,19 +1514,35 @@ class LivePipeline:
                 # 高频原生调用，故降到 10s（换设备的跟随延迟最多 10s，可接受）。
                 if wall_now >= next_probe:
                     next_probe = wall_now + 10.0
+                    new_cap = None
+                    switched_to = None
                     try:
                         if probe_pa is None:
                             probe_pa = audio.pyaudio.PyAudio()
                         new_default = audio.get_default_loopback(probe_pa)
                         if new_default["name"] != cur_device:
+                            # **先建新、后拆旧**：换设备瞬间新设备可能打不开 ——
+                            # 旧写法先把旧 cap stop+terminate，新 cap 一抛异常，
+                            # cap 就指向死对象且 cur_device 没变 → 永远不会再重建，
+                            # 采集永久聋掉。现在失败时旧 cap 原样保留，10s 后重试。
+                            new_cap = audio.LoopbackCapture().start()
+                            new_seg = new_segmenter()   # 换设备后重置分段状态
                             cap.stop()
                             cap.terminate()
-                            cap = audio.LoopbackCapture().start()
+                            cap, segmenter = new_cap, new_seg
                             cur_device = cap.device_name
-                            segmenter = new_segmenter()   # 换设备后重置分段状态
-                            self.on_state(f"设备切换 → {cur_device}")
+                            switched_to = cur_device
                     except Exception:
                         probe_pa = None      # 探测对象失效则下次重建
+                        if new_cap is not None and new_cap is not cap:
+                            try:
+                                new_cap.stop()
+                                new_cap.terminate()
+                            except Exception:
+                                pass
+                    if switched_to:
+                        self.on_state(f"设备切换 → {switched_to}")
+                flushed = False
                 if not len(audio16k):
                     # 音频断流（视频暂停 / 一段 CG 结束 / 播放器静默）：
                     # **不能直接 continue** —— VAD 只在收到新音频时才能累计静音、判定句尾，
@@ -1463,6 +1550,12 @@ class LivePipeline:
                     # 用户实测表现：字幕整体落后一句、非常不连贯。
                     if wall_now - last_audio_t[0] < idle_flush_s:
                         continue
+                    # flush_wall = **最后一次真收到音频**的时刻。收尾段 end_sample==
+                    # total_samples，而 total_samples 对应的是那个时刻（不是现在）——
+                    # 拿 wall_now 当映射基准会把收尾行的段尾时间/延迟整体推后
+                    # idle_flush_s（默认 2.5s），延迟计量失真。下面这行赋值顺带把
+                    # "断流收尾"节流重新武装（空闲期间每 idle_flush_s 才收尾一次）。
+                    flush_wall = last_audio_t[0]
                     last_audio_t[0] = wall_now
                     segments, fed_total = [], segmenter.total_samples
                     flush_fn = getattr(segmenter, "flush", None)
@@ -1481,6 +1574,7 @@ class LivePipeline:
                                           f"{len(seg['pcm'])/16000:.1f}s）")
                     if not segments:
                         continue
+                    flushed = True
                 else:
                     last_audio_t[0] = wall_now
                     # 流式分段：只在句尾静音/超长时才输出，长句不会被切断
@@ -1508,7 +1602,12 @@ class LivePipeline:
                                 and wall_now >= next_partial[0]
                                 and pdur >= last_partial_dur[0] + 0.45
                                 and work_q.empty()):      # 有最终任务积压就让位
-                            next_partial[0] = wall_now + partial_interval_s
+                            # 自适应节奏：短段 0.8s、长段（>3s）1.6s —— 编码器
+                            # 底价 ~270ms 与段长无关（§八十一），长句期间降频把
+                            # 说话期的编码器占空比从 ~35% 降到 ~25%，final 尾延迟更稳
+                            next_partial[0] = wall_now + (partial_interval_s
+                                                          if pdur < 3.0
+                                                          else partial_interval_s * 2.0)
                             last_partial_dur[0] = pdur
                             try:
                                 partial_q.put_nowait((pend["pcm"], pend["seg_id"]))
@@ -1518,6 +1617,10 @@ class LivePipeline:
                     piece = seg["pcm"]
                     dur = len(piece) / 16000
                     if dur < min_sentence_s:
+                        # 这段的 pending 音频可能已达到 partial_min_s 并上过屏
+                        #（"部分识别"）—— 直接丢弃会留下永远等不到译文的幽灵残句
+                        if seg.get("seg_id") is not None:
+                            self.on_drop(seg["seg_id"])
                         continue
                     # 近静音护栏（能量门）：声音很小/只有环境底噪时，VAD 也会切出片段，
                     # 喂给 whisper 极易触发"复读幻觉"（实测整屏 "rover rover rover…"）。
@@ -1526,6 +1629,8 @@ class LivePipeline:
                     if piece_rms < min_rms:
                         self.stats["skipped_quiet"] = (
                             self.stats.get("skipped_quiet", 0) + 1)
+                        if seg.get("seg_id") is not None:
+                            self.on_drop(seg["seg_id"])   # 撤回可能已上屏的部分识别
                         continue
                     # 语音占比门：VAD 判定"有声"的帧占比过低 → 多半是音乐/纯伴奏。
                     # 2026-09-16 改：**不再整段丢弃**（旧行为在游戏实况里 5/13 段被丢，
@@ -1534,8 +1639,10 @@ class LivePipeline:
                     # —— WhisperLive 的经验：VAD 只负责切段，音频一律送模型，事后过滤。
                     music_risk = (float(seg.get("speech_ratio", 1.0) or 0.0)
                                   < min_speech_ratio)
-                    # 语音段结束的墙钟时刻（样本号 → 墙钟，fed_total 对应 wall_now）
-                    seg_end_wall = wall_now - (fed_total - seg["end_sample"]) / 16000
+                    # 语音段结束的墙钟时刻（样本号 → 墙钟）。常规段刚喂完音频，
+                    # fed_total 对应 wall_now；断流收尾段对应的是 flush_wall（见上）。
+                    seg_end_wall = ((flush_wall if flushed else wall_now)
+                                    - (fed_total - seg["end_sample"]) / 16000)
                     # 队列满：丢最旧的，投递永不阻塞（见 except 分支）
                     self.on_activity("识别中…")
                     try:
@@ -1543,13 +1650,32 @@ class LivePipeline:
                                            seg.get("seg_id"), music_risk,
                                            seg.get("cut", "")))
                     except queue.Full:
-                        # 有积压：**丢最旧的一条**而不是等空位。
-                        # 旧写法在这里阻塞等待，一旦 GPU 繁忙（例如同时打游戏）
-                        # 采集+VAD 循环就整体停住 → 后面完全不出字幕，表现为"卡死"。
+                        # 有积压：先找 music_risk 的排队项丢（它们大概率会被识别
+                        # 后的音乐门丢掉，白烧一次 270~340ms 的 GPU），找不到再丢
+                        # 最旧的。旧写法在这里阻塞等待会让采集循环整体停住。
+                        victim = None
                         try:
-                            work_q.get_nowait()
-                        except queue.Empty:
-                            pass
+                            for _it in list(work_q.queue):
+                                if _it[5]:
+                                    victim = _it
+                                    break
+                        except Exception:
+                            victim = None
+                        if victim is not None:
+                            try:
+                                work_q.queue.remove(victim)
+                                if victim[4] is not None:
+                                    self.on_drop(victim[4])   # 撤回可能已上屏的部分识别
+                            except ValueError:
+                                victim = None    # 刚好被 worker 取走 → 走丢最旧兜底
+                        if victim is None:
+                            try:
+                                old_item = work_q.get_nowait()
+                            except queue.Empty:
+                                old_item = None
+                            if old_item and old_item[4] is not None:
+                                # 被丢的旧段可能已上过"部分识别"→ 撤回（幽灵残句）
+                                self.on_drop(old_item[4])
                         try:
                             work_q.put_nowait(("final", piece, seg_end_wall, dur,
                                                seg.get("seg_id"), music_risk,

@@ -42,8 +42,9 @@ class _Spinner(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.setFixedSize(18, 18)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setWindowOpacity(0.9)
+        # 不再设 WA_TransparentForMouseEvents（§八十二）：穿透控件永远收不到
+        # hover，start(tip) 设置的"识别中…/翻译中…"tooltip 从来显示不出来。
+        # 18×18 的角落块，允许 hover 不影响拖动。
         self.hide()
 
     def _tick(self):
@@ -88,6 +89,11 @@ def _teardown_ghost(g):
 
 
 class SubtitleOverlay(QWidget):
+    # 排版度量缓存（热路径：每个流式 chunk 都会全量测字；QFont/QFontMetrics 与
+    # "同文本同宽度"的量高结果都可以复用 —— 纯 perf，无行为差异）。
+    _FM_CACHE: dict = {}     # 字号 -> QFontMetrics（FAMILY 是模块常量，同字号同度量）
+    _H_CACHE: dict = {}      # (text, size, width) -> 行高（流式期间同一文本反复测）
+
     def __init__(self, screen_index: int = 0,
                  font_size_src: int = 12, font_size_dst: int = 17,
                  opacity: float = 0.92):
@@ -110,8 +116,29 @@ class SubtitleOverlay(QWidget):
         self.activity_timed_out = False   # 被超时清掉过（外面据此写一条日志）
         self._cur_h = 0                   # 当前窗口高度（避免无谓的 setFixedHeight）
         self._src_size, self._dst_size = font_size_src, font_size_dst
-        self._min_src, self._min_dst = 8, 9
+        # 译文行最小字号 9→12（§八十二）：以前长句兜底缩字号时译文能缩到 9pt、
+        # 下一句又弹回来 —— 字号忽大忽小比行数多一行更难受
+        self._min_src, self._min_dst = 8, 12
         self._spinner = _Spinner(self)     # 右下角"正在干活"转圈
+        # 静默期"监听中 mm:ss"小角标（§八十二）：回答用户唯一会问的问题——
+        # "它还活着吗"。以前静音/纯音乐期屏幕停在最后一句、与卡死完全不可区分。
+        # ⚠ 必须传 self 作为父控件：QLabel("") 是**顶层窗口**——用户截图实锤
+        #（左上角冒出一个带标题栏的"监听中 00:11"小窗）。
+        self._idle_lbl = QLabel(self)
+        self._idle_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+                                    True)
+        self._idle_lbl.setStyleSheet(
+            "color: rgba(165,165,175,150); background: rgba(10,10,14,110);"
+            "border-radius: 4px; padding: 1px 8px;")
+        self._idle_lbl.hide()
+        self._idle_text = None
+        self.on_position_changed = None    # 拖动释放回调（live_demo 用来持久化位置）
+        # 置顶健壮化（§八十二）：全屏游戏/抢顶窗口会把字幕压下去 —— 每 2s 温和地
+        # 重申 TOPMOST（SWP_NOACTIVATE 不抢焦点；拖动中跳过）。
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.setInterval(2000)
+        self._topmost_timer.timeout.connect(self._reassert_topmost)
+        self._topmost_timer.start()
         self._cues: list[dict] = []       # [{cid, src, dst, lang}]（旧的在前）
         # 已经上过屏的 cid：被挤出 _cues 的**旧句**若再来迟到更新，绝不能重新 append
         # —— 那会让它"复活"成当前行，把真正最新的那句挤进历史行
@@ -138,6 +165,7 @@ class SubtitleOverlay(QWidget):
         self._reveal_timer.timeout.connect(self._advance)
         self._ghosts: list[QLabel] = []   # 绝对定位的残影（不进布局，不影响排版）
 
+        self._width_pct = 0.875           # 宽度占屏比（设置页可调，§八十三）
         screens = QGuiApplication.screens()
         self._screen_index = min(screen_index, len(screens) - 1)
         self.resize_to_screen(screens[self._screen_index])
@@ -148,8 +176,8 @@ class SubtitleOverlay(QWidget):
     @property
     def _max_width(self) -> int:
         screens = QGuiApplication.screens()
-        geo = screens[min(self._screen_index, len(screens) - 1)].geometry()
-        return min(1075, int(geo.width() * 0.875))
+        geo = screens[min(self._screen_index, len(screens) - 1)].availableGeometry()
+        return min(1075, int(geo.width() * self._width_pct))
 
     @property
     def _max_content_h(self) -> int:
@@ -170,7 +198,8 @@ class SubtitleOverlay(QWidget):
             - self._box.contentsMargins().right() - 4
 
     def resize_to_screen(self, screen):
-        geo = screen.geometry()
+        # availableGeometry：排除任务栏 —— 以前用 geometry，默认位置压在任务栏上
+        geo = screen.availableGeometry()
         self._width = self._max_width
         self.setFixedWidth(self._width)
         self._bottom = geo.y() + geo.height() - 140
@@ -187,10 +216,71 @@ class SubtitleOverlay(QWidget):
         self.resize_to_screen(screens[self._screen_index])
         return self._screen_index
 
+    def set_width_pct(self, pct: float):
+        """宽度占屏比（§八十三，设置页 50~95%）：立即重排。"""
+        try:
+            self._width_pct = min(0.95, max(0.5, float(pct)))
+        except Exception:
+            return
+        screens = QGuiApplication.screens()
+        self.resize_to_screen(screens[min(self._screen_index, len(screens) - 1)])
+
+    def restore_default_position(self):
+        """清掉拖动记忆，回到默认摆放（底部 -140、不压任务栏）。"""
+        screens = QGuiApplication.screens()
+        self.resize_to_screen(screens[min(self._screen_index, len(screens) - 1)])
+
+    def restore_position(self, x: int, y: int):
+        """恢复上次拖放的位置（§八十二）。钳进当前屏的**可用**区域——
+        拔显示器/改分辨率后存的位置可能悬空，落回可见处而不是消失在屏幕外。"""
+        try:
+            screens = QGuiApplication.screens()
+            avail = screens[min(self._screen_index, len(screens) - 1)].availableGeometry()
+            x = min(max(int(x), avail.x()), avail.x() + avail.width() - self.width())
+            y = min(max(int(y), avail.y()), avail.y() + avail.height() - self.height())
+            self.move(x, y)
+            self._bottom = y + self.height()
+        except Exception:
+            pass
+
+    def _reassert_topmost(self):
+        if self._click_through:
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            return                       # 拖动中别动窗口
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            # HWND_TOPMOST(-1) + SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE：
+            # 只重申 z 序，不动几何、不抢焦点
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        except Exception:
+            pass
+
+    def set_idle_notice(self, text: str | None):
+        """静默期"监听中 mm:ss"小角标（左下角）：有内容立即让位。
+
+        与 set_status 不同：不隐藏字幕、不参与排版，纯角落覆盖；
+        文案去重（drain 每 60ms 调一次，别每帧都 setText）。
+        """
+        if text == self._idle_text:
+            return
+        self._idle_text = text
+        if text:
+            self._idle_lbl.setText(text)
+            self._idle_lbl.adjustSize()
+            m = self._box.contentsMargins()
+            self._idle_lbl.move(m.left() + 4,
+                                self.height() - self._idle_lbl.height() - 6)
+            self._idle_lbl.show()
+            self._idle_lbl.raise_()
+        else:
+            self._idle_lbl.hide()
+
     # ---------------- 内容 ----------------
     def set_history(self, n: int):
-        self._history = max(0, min(3, int(n)))
-        self._relayout()
+        self._history = max(0, min(5, int(n)))     # 3→5（§八十二：历史行是本软件的
+        self._relayout()                           # 独特卖点，网课/直播回看要更多行）
 
     def set_display_mode(self, mode: str):
         self._mode = mode if mode in (MODE_BILINGUAL, MODE_TARGET, MODE_SOURCE) \
@@ -214,6 +304,8 @@ class SubtitleOverlay(QWidget):
 
     def set_status(self, text: str):
         """显示状态文案（启动中/等待语音…），隐藏字幕内容。"""
+        if text == self._status:
+            return      # 同文案重复设置（暂停期间队列里每条积压消息都来一次）：别整轮重排
         self._status = text
         self._relayout()
 
@@ -226,17 +318,27 @@ class SubtitleOverlay(QWidget):
         （用户反馈："还没来得及在当前句显示，就被下一句挤到历史行了"）。
         非前缀的变短是真更正（改译/术语修正），照常写入。
         """
+        changed = False
         for c in self._cues:
             if c["cid"] == cid:
-                if src:
+                if src and c["src"] != src:
                     c["src"] = src
+                    changed = True
                 if dst is not None:
                     old = c.get("dst")
-                    if not (dst and isinstance(old, str) and old
-                            and len(dst) < len(old) and old.startswith(dst)):
+                    if dst == "":
+                        # 空译文＝这次翻译没出中文（三次兜底全失败），不是"一条更短的
+                        # 更新"—— 绝不能把已上屏的流式译文抹掉（数据也只前进）。
+                        pass
+                    elif (isinstance(old, str) and old and len(dst) < len(old)
+                          and old.startswith(dst)):
+                        pass      # 流式中间态：屏上本来就不显示，数据也不写回（只前进）
+                    elif old != dst:
                         c["dst"] = dst
-                if lang:
+                        changed = True
+                if lang and c["lang"] != lang:
                     c["lang"] = lang
+                    changed = True
                 break
         else:
             if cid in self._shown_cids:
@@ -253,8 +355,12 @@ class SubtitleOverlay(QWidget):
             keep = self._history + 2
             if len(self._cues) > keep:
                 self._cues = self._cues[-keep:]
-        self._status = None                 # 有字幕了就清掉状态文案
-        self._relayout()
+            changed = True
+        if self._status is not None:        # 有字幕了就清掉状态文案
+            self._status = None
+            changed = True
+        if changed:
+            self._relayout()
 
     def set_activity(self, text: str):
         """实时活动提示（"识别中…/翻译中…"）：**右下角小转圈**，不再占一行文字。
@@ -313,7 +419,11 @@ class SubtitleOverlay(QWidget):
             else:
                 text = c.get("dst") or c.get("src") or ""
             if text:
-                rows.append((text, "history", self._src_size, self._min_src))
+                # 历史行显示的是**译文**，却一直按原文号渲染 —— 与当前行 19pt 粗体
+                # 白字落差过大、密集场合几乎不可读。提到 max(原文号, 译文号×0.78)。
+                rows.append((text, "history",
+                             max(self._src_size, int(self._dst_size * 0.78)),
+                             self._min_src))
         # 当前行
         src, dst = cur.get("src", ""), cur.get("dst")
         if self._mode == MODE_BILINGUAL:
@@ -370,9 +480,17 @@ class SubtitleOverlay(QWidget):
         内边距必须算进去——否则每行少算 8px，行数一多就会把最后一行裁掉
         （表现为"翻译只显示开头"）。
         """
-        fm = QFontMetrics(QFont(FAMILY, size))
-        return fm.boundingRect(0, 0, width, 2000,
-                               Qt.TextFlag.TextWordWrap, text).height() + 8
+        fm = self._FM_CACHE.get(size)
+        if fm is None:
+            fm = self._FM_CACHE[size] = QFontMetrics(QFont(FAMILY, size))
+        key = (text, size, width)
+        h = self._H_CACHE.get(key)
+        if h is None:
+            if len(self._H_CACHE) > 4096:
+                self._H_CACHE.clear()      # 有界：长字幕跑几小时也别无限涨
+            h = self._H_CACHE[key] = fm.boundingRect(
+                0, 0, width, 2000, Qt.TextFlag.TextWordWrap, text).height() + 8
+        return h
 
     def _fit(self, rows, width, max_h):
         """逐档降字号，直到所有行都能装进可用高度（真实字体度量，不是估算）。"""
@@ -396,7 +514,10 @@ class SubtitleOverlay(QWidget):
         width = self._content_width()
         src_h = self._height_of("Ag", self._src_size, width) + 2
         dst_h = self._height_of("Ag", self._dst_size, width) + 2
-        h = self._history * src_h
+        # 历史行高度与 _rows 同口径（§八十二：历史行字号已提层，别按原文号预留，
+        # 否则高度跳变）
+        h = self._history * (self._height_of(
+            "Ag", max(self._src_size, int(self._dst_size * 0.78)), width) + 2)
         if self._mode in (MODE_BILINGUAL, MODE_SOURCE):
             h += src_h
         if self._mode in (MODE_BILINGUAL, MODE_TARGET):
@@ -577,6 +698,11 @@ class SubtitleOverlay(QWidget):
             anim.setDuration(ms)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
+            # 动画走完就摘掉效果（§八十二）：QGraphicsOpacityEffect 强制 label 走
+            # 栅格化重绘路径，留着它之后每个流式 chunk 的 setText 都变慢。
+            # finished 槽里不能直接动控件，延后一拍（与 _drop_ghost 同款约束）。
+            anim.finished.connect(
+                lambda l=lbl: QTimer.singleShot(0, lambda: l.setGraphicsEffect(None)))
             anim.start()
             lbl._fade = anim
         except Exception:
@@ -697,8 +823,10 @@ class SubtitleOverlay(QWidget):
             sizes = [base for _t, _k, base, _mn in rows]
             total = sum(self._height_of(t, s, width) + 2 for (t, _k, _b, _m), s
                         in zip(rows, sizes))
-        if total > self._max_content_h:
-            sizes, total = self._fit(rows, width, self._max_content_h)   # 兜底
+        if total > self._hard_content_h:
+            # 先丢历史、再长高（窗口最多到屏高 50%）、最后才缩字号 —— 以前在 34%
+            # 就缩字，长句译文会突然变小、下一句又弹回（§八十二）
+            sizes, total = self._fit(rows, width, self._hard_content_h)   # 兜底
         # 用户正按着鼠标（拖动中）→ **只冻结窗口尺寸/位置**，文字照常刷新；
         # 判断用真实按键状态，绝不用可能"卡住"的自有标志位。
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
@@ -746,6 +874,12 @@ class SubtitleOverlay(QWidget):
         if self._dragging:
             self._dragging = False
             self._relayout()          # 应用拖动期间攒下的排版变化
+            if self.on_position_changed is not None:
+                # 位置记忆（§八十二）：拖完即写回（强杀也不丢）
+                try:
+                    self.on_position_changed(self.x(), self.y(), self._screen_index)
+                except Exception:
+                    pass
 
     def set_click_through(self, on: bool):
         hwnd = int(self.winId())

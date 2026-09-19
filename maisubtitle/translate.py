@@ -15,61 +15,6 @@ def to_simplified(text: str) -> str:
     return _convert(text, "zh-cn")
 
 
-class TermProtector:
-    """层3 术语保护：唯一三位数占位符（避开源文数字）→ 翻译 → 还原。"""
-
-    def __init__(self):
-        self.masked: dict[str, str] = {}
-        self._n = 0
-
-    def mask(self, text: str, hits: list[dict]) -> str:
-        self.masked = {}
-        self._n = 0
-        used = set(re.findall(r"\d{3}", text))
-        out, last = [], 0
-        for h in hits:
-            out.append(text[last:h["start"]])
-            self._n += 1
-            ph = str(900 + self._n)
-            while ph in used:
-                self._n += 1
-                ph = str(900 + self._n)
-            used.add(ph)
-            self.masked[ph] = h["target_zh"]
-            out.append(ph)
-            last = h["end"]
-        out.append(text[last:])
-        return "".join(out)
-
-    def unmask(self, translated: str) -> tuple[str, list[str]]:
-        missing, out = [], translated
-        for ph, zh in self.masked.items():
-            if ph in out:
-                out = out.replace(ph, zh)
-            else:
-                missing.append(ph)
-        out = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", out)
-        return out, missing
-
-    def post_fix(self, translated: str, target_zh: str,
-                 ratio_threshold: float = 68.0) -> tuple[str, bool]:
-        """译文侧模糊修正：找最接近目标词的窗口替换。"""
-        from rapidfuzz import fuzz
-        best_ratio, best = 0.0, None
-        n = len(target_zh)
-        for size in (n - 1, n, n + 1):
-            if size <= 0:
-                continue
-            for i in range(0, len(translated) - size + 1):
-                r = fuzz.ratio(translated[i: i + size], target_zh)
-                if r > best_ratio:
-                    best_ratio, best = r, (i, i + size)
-        if best and best_ratio >= ratio_threshold:
-            i, j = best
-            return translated[:i] + target_zh + translated[j:], True
-        return translated, False
-
-
 _FORCE_ZH_SYS = ("你只会输出简体中文。把用户给的外语对白翻译成自然的简体中文口语，"
                  "严禁照抄原文、严禁输出英文、不要解释、不要加引号。")
 
@@ -362,8 +307,9 @@ class HyMT2:
                                skip_special_tokens=True,
                                clean_up_tokenization_spaces=False).strip()
 
-    def translate(self, text: str, src_lang: str,
-                  context: list[str] | None = None) -> tuple[str, dict]:
+    def _build_messages(self, text: str, src_lang: str,
+                        context: list[str] | None) -> list[dict]:
+        """提示词：术语 → 前文 → 待翻文本。流式与非流式**共用**这一份，别分叉。"""
         parts = []
         if self.terms:
             parts.append("术语对照（译文中出现的词语必须使用给定译名）:\n"
@@ -373,11 +319,58 @@ class HyMT2:
                          + "\n".join(f"- {c}" for c in list(context)[-5:]))
         parts.append("将以下文本翻译成简体中文，注意只需要输出翻译后的结果，"
                      "不要额外解释:\n\n" + text)
-        msgs = [{"role": "user", "content": "\n\n".join(parts)}]
+        return [{"role": "user", "content": "\n\n".join(parts)}]
+
+    def translate(self, text: str, src_lang: str,
+                  context: list[str] | None = None) -> tuple[str, dict]:
         t0 = time.perf_counter()
-        out = self.chat(msgs)
+        out = self.chat(self._build_messages(text, src_lang, context))
         return out, {"latency_s": round(time.perf_counter() - t0, 3),
                      "engine": "hymt2"}
+
+    def translate_stream(self, text: str, src_lang: str,
+                         context: list[str] | None = None,
+                         max_tokens: int = 160):
+        """流式翻译：逐 token 产出**累积**译文（与非流式同提示词、同贪心参数）。
+
+        §七十六 的遗留 TODO：HyMT2 走 transformers generate，用 TextIteratorStreamer
+        在工作线程里生成、迭代器产累积文本 —— 界面上译文逐 token 长出来，不再等整句
+        生成完才出现（qwen 引擎早已如此，hymt2 是默认引擎却一直整句产出）。
+        generate 若中途抛异常，finally 里 streamer.end() 兜底放行迭代器，否则父进程
+        会白等 30s 流式超时（子进程协议错误回包的老教训）。
+        """
+        import threading
+        from transformers import TextIteratorStreamer
+        msgs = self._build_messages(text, src_lang, context)
+        prompt = self.tok.apply_chat_template(msgs, tokenize=False,
+                                              add_generation_prompt=True)
+        inputs = self.tok(prompt, return_tensors="pt").to(self.model.device)
+        streamer = TextIteratorStreamer(self.tok, skip_prompt=True,
+                                        skip_special_tokens=True,
+                                        clean_up_tokenization_spaces=False)
+
+        def _generate():
+            try:
+                with self.torch.inference_mode():
+                    self.model.generate(**inputs, max_new_tokens=max_tokens,
+                                        do_sample=False, repetition_penalty=1.05,
+                                        streamer=streamer)
+            except Exception:
+                pass                      # 异常也要放行迭代器（见 docstring）
+            finally:
+                streamer.end()
+
+        threading.Thread(target=_generate, daemon=True,
+                         name="hymt2-stream").start()
+        acc = ""
+        for delta in streamer:            # TextIteratorStreamer 产**增量**，这里拼成累积
+            if not delta:
+                continue
+            acc += delta
+            partial = acc.strip()
+            if not partial or partial.endswith("\ufffd"):
+                continue                  # 与 QwenCT2 同口径：半个多字节字符不产出
+            yield partial
 
 
 class NullMT:
@@ -413,8 +406,8 @@ def translator_candidates(engine: str = "qwen") -> list:
     return {
         "hymt2": [HyMT2, QwenCT2],
         "qwen":  [QwenCT2],
-        "qwen3": [lambda: QwenCT2(model_dir="Qwen3-1.7B-ct2",
-                                  tok_dir="Qwen3-1.7B-ct2"), QwenCT2],
+        "qwen3": [lambda **kw: QwenCT2(model_dir="Qwen3-1.7B-ct2",
+                                   tok_dir="Qwen3-1.7B-ct2", **kw), QwenCT2],
     }.get(engine, [QwenCT2])
 
 

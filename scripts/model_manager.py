@@ -79,14 +79,14 @@ def cmd_list():
             if t != tier:
                 continue
             mb = dir_size_mb(model_path(name))
-            ok = "✔" if mb > 0.1 else ("✘ 必需" if req else "–  可选")
+            ok = "[OK]" if mb > 0.1 else ("[缺] 必需" if req else "[可选]")
             print(f"  {ok:6s} {name:15s} {mb:8.0f} MB   {label}")
         print()
     missing = [n for n, e in CATALOG.items() if e[3] and dir_size_mb(model_path(n)) <= 0.1]
     if missing:
         dl_names = [CATALOG[n][0] for n in missing
                     if CATALOG[n][0] not in ("__local__", "__converted__")]
-        print("⚠ 缺失的必需项：" + "、".join(CATALOG[n][1] for n in missing))
+        print("[注意] 缺失的必需项：" + "、".join(CATALOG[n][1] for n in missing))
         if dl_names:
             print("  下载：python scripts/download_models.py --only " + " ".join(dl_names))
         if "qwen_1_5b_ct2" in missing:
@@ -99,7 +99,7 @@ def cmd_list():
         if "hymt2" in missing:
             print("  Hy-MT2-1.8B 约 4.1GB，下载后即用（走 transformers/PyTorch，需要 torch）")
     else:
-        print("✔ 必需项齐全，直接启动即可（启动_MaiSubtitle.bat）")
+        print("[OK] 必需项齐全，直接启动即可（启动_MaiSubtitle.bat）")
 
 
 def cmd_download(targets):
@@ -126,12 +126,14 @@ def cmd_download(targets):
             continue          # 已经转换过 → 不再需要 HF 权重（省 3GB 下载）
         if dir_size_mb(model_path(n)) < 0.1:
             to_run.append(dl)
+    failed = 0
     if to_run:
         import subprocess
         print("下载:", to_run)
         r = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "download_models.py"),
                             "--only", *to_run])
         if r.returncode != 0:
+            failed = 1
             print("下载有失败项（网络/镜像问题），重跑即可断点续传")
     # 翻译模型：HF 权重已就位但 CT2 还没转换 → 自动转换（否则跑起来没译文）
     for hf, ct2, key in (("qwen_1_5b", "qwen_1_5b_ct2", "1.5b"),
@@ -142,6 +144,7 @@ def cmd_download(targets):
             r = subprocess.run([sys.executable,
                                 str(PROJECT_ROOT / "scripts" / "convert_qwen_ct2.py"), key])
             if r.returncode != 0:
+                failed = 1
                 print(f"[注意] 自动转换失败（见上）；可单独重跑："
                       f"scripts/model_manager.py convert {hf}")
     # FireRedVAD：权重下好了但 ONNX 还没导出 → 自动导出（否则 VAD 用不上 FireRed）
@@ -152,9 +155,11 @@ def cmd_download(targets):
         r = subprocess.run([sys.executable,
                             str(PROJECT_ROOT / "scripts" / "export_fireredvad_onnx.py")])
         if r.returncode != 0:
+            failed = 1
             print("[注意] 自动导出失败（见上）；可单独重跑："
                   "scripts/model_manager.py export firered")
     cmd_list()
+    return failed
 
 
 def cmd_convert(name: str):
@@ -229,7 +234,7 @@ def main():
     if a.cmd == "list":
         cmd_list()
     elif a.cmd == "download":
-        cmd_download(a.target or ["all"])
+        sys.exit(cmd_download(a.target or ["all"]))
     elif a.cmd == "convert":
         cmd_convert(one)
     elif a.cmd == "export":

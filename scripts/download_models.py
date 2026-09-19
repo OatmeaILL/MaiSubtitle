@@ -79,27 +79,32 @@ MS_MODELS = {
     "fsmn_vad": {
         "repo": "damo/speech_fsmn_vad_zh-cn-16k-common-onnx",
         "dest": "fsmn-vad-onnx",
+        "need": ["model_quant.onnx"],
     },
     # Qwen2.5-1.5B 官方权重（翻译模型的 **CT2 转换源**；转换见 scripts/convert_qwen_ct2.py）
     "qwen_1_5b_hf": {
         "repo": "Qwen/Qwen2.5-1.5B-Instruct",
         "dest": "Qwen2.5-1.5B-Instruct-hf",
+        "need": ["model.safetensors", "tokenizer_config.json"],
     },
     # Qwen3-1.7B 官方权重（质量档翻译的 CT2 转换源；可选）
     "qwen3_1_7b_hf": {
         "repo": "Qwen/Qwen3-1.7B",
         "dest": "Qwen3-1.7B-hf",
+        "need": ["model.safetensors", "tokenizer_config.json"],
     },
     # 接缝标点的 CPU 小模型（可选；没装时 punct_engine=auto 自动走 Qwen，功能不受影响）
     "punc_cpu": {
         "repo": "iic/punc_ct-transformer_zh-cn-common-vocab272727-onnx",
         "dest": "punc-ct-transformer-zh-en-onnx",
+        "need": ["model_quant.onnx", "config.yaml"],
     },
     # FireRedVAD 的 Stream-VAD 权重（**默认 VAD 的导出源**，2.3MB，Apache-2.0）：
     # 下载后由 scripts/export_fireredvad_onnx.py 导出成 models/fireredvad-onnx（≈2MB）
     "firered": {
         "repo": "FireRedTeam/FireRedVAD",
         "dest": "fireredvad",
+        "need": ["Stream-VAD/model.pth.tar", "Stream-VAD/cmvn.ark"],
     },
     # 腾讯混元 Hy-MT2-1.8B（**默认翻译引擎 hymt2 的权重**，Apache-2.0，约 4.1GB）：
     # 架构 HunYuanDenseV1ForCausalLM 不被 CTranslate2 支持 → 只能走 transformers/PyTorch，
@@ -190,7 +195,8 @@ def looks_like_error_page(p: Path) -> bool:
     （6,990 字节，以 `<!--` 开头）→ curl 退出码是 0，光看"文件非空"根本发现不了。
     真模型是二进制（ONNX/protobuf），既不会以 '<' 开头，也不会整段能 UTF-8 解码。
     """
-    head = p.read_bytes()[:512]
+    with p.open("rb") as _f:
+        head = _f.read(512)
     if not head:
         return True
     if head.lstrip()[:1] == b"<":
@@ -260,12 +266,19 @@ def download_ms(name: str, spec: dict) -> bool:
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            # 截断/损坏的状态文件只影响"哪些项被记成已下载"—— 下载器本来就会
+            # 逐项真查文件（missing_files），所以当空表重来即可，别把下载链搞断
+            print(f"[注意] {STATE_FILE.name} 损坏，按空状态处理（会重新核对每项）")
     return {}
 
 
 def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 
 def download_hf(name: str, spec: dict) -> bool:
@@ -295,9 +308,6 @@ def download_hf(name: str, spec: dict) -> bool:
                 print(f"  [warn] {label} 跑完仍缺 {miss}")
                 break                      # 同一通道再试也是同样结果 → 换下一个
             except Exception as e:
-                if spec.get("optional"):
-                    print(f"  [skip] {name}: {str(e)[:120]}")
-                    return True
                 print(f"  [retry {label} {attempt + 1}/2] {name}: {str(e)[:120]}")
                 time.sleep(3 * (attempt + 1))
     ms_repo = spec.get("ms_fallback")

@@ -97,7 +97,7 @@ class WhisperASR:
     def transcribe(self, audio: np.ndarray, language: str | None = None,
                    prompt: str | None = None,
                    return_confidence: bool = False, beam_size: int = 5,
-                   without_timestamps: bool = False):
+                   without_timestamps: bool = False, no_fallback: bool = False):
         """audio: int16 16k 单声道。返回 (text, meta)。
 
         return_confidence=True 时 meta 附带 avg_logprob / no_speech_prob
@@ -112,7 +112,12 @@ class WhisperASR:
         segments, info = self.model.transcribe(
             x, language=language, initial_prompt=prompt,
             beam_size=beam_size, vad_filter=False, condition_on_previous_text=False,
-            without_timestamps=without_timestamps)
+            without_timestamps=without_timestamps,
+            # no_fallback：faster-whisper 默认带 6 档温度回退（压缩比/置信度不过关
+            # 就升温重跑，最坏 6 次解码）。部分识别是**丢弃型**结果（马上会被终稿
+            # 覆盖），回退纯属白烧 GPU —— 锁 0 温度并关掉两道检查。
+            **({"temperature": 0.0, "log_prob_threshold": None,
+                "compression_ratio_threshold": None} if no_fallback else {}))
         texts, probs = [], []
         for s in segments:
             texts.append(s.text)
@@ -147,13 +152,16 @@ class HttpASR:
       2. 多一次 HTTP 往返（本机约 1~10ms，可忽略；跨机另算）。
     """
 
-    def __init__(self, url: str, model: str = "", timeout: float = 60.0):
+    def __init__(self, url: str, model: str = "", timeout: float = 25.0):
+        # timeout 必须 < gpu_proc.DEFAULT_TIMEOUT(30s)：服务端慢过看门狗的话，
+        # 子进程会被父进程当成"卡死"杀掉重载模型（与 VolcWsAsr 的 20s 同一约束）
         import requests  # 延迟导入：不用 HTTP 后端时不给启动增加依赖
         self._requests = requests
         self.url = url
         self.model = model
         self.timeout = timeout
         self.load_s = 0.0
+        self._session = requests.Session()   # 每句一次请求：复用连接，免每句 TCP+TLS 握手
 
     @staticmethod
     def _wav_bytes(pcm: np.ndarray) -> bytes:
@@ -178,8 +186,8 @@ class HttpASR:
             data["model"] = self.model
         if language:
             data["language"] = language
-        r = self._requests.post(self.url, files=files, data=data,
-                                timeout=self.timeout)
+        r = self._session.post(self.url, files=files, data=data,
+                               timeout=self.timeout)
         r.raise_for_status()
         try:
             js = r.json()

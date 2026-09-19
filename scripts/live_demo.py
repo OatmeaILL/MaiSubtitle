@@ -122,6 +122,26 @@ def on_subtitle(cid, src, dst, lang, lat_ms):
 
 def on_state(s):
     last_state[0] = s
+    if s.startswith("vram:"):
+        _last_vram[0] = s              # 供诊断窗口展示（以前只进日志文件）
+    if "字幕恢复" in s:
+        # 恢复侧一直没有通知：用户体感"停一下又恢复"却从不知道它自己修好了（§八十二）
+        try:
+            ui_queue.put_nowait(("__notify__", s, ""))
+        except Exception:
+            pass
+    if s == "running" and not _ready_notified[0]:
+        # "一切就绪"的确认时刻（§八十二）：以前齐全时只 print 进看不见的控制台，
+        # 用户盯着"等待语音…"不知道模型到底加载完没有
+        _ready_notified[0] = True
+        try:
+            from maisubtitle import selfcheck as _sc
+            ui_queue.put_nowait((
+                "__notify__",
+                "一切就绪：" + "；".join(_sc.summary(cfg))
+                + "\n播放语音即可出字幕（热键见托盘菜单-快捷键…）", ""))
+        except Exception:
+            pass
     print(f"|-- {s}", flush=True)
     try:
         with open(LOGS_DIR / "live_demo.log", "a", encoding="utf-8") as f:
@@ -188,7 +208,6 @@ def shutdown_report():
 
 
 if opts.no_ui:
-    import time
     try:
         while True:
             _time.sleep(1)
@@ -222,6 +241,25 @@ overlay = SubtitleOverlay(cfg.screen, cfg.font_size_src, cfg.font_size_dst,
                           cfg.opacity)
 overlay.show()
 overlay.set_display_mode(cfg.display_mode)
+overlay.set_width_pct(float(getattr(cfg, "width_pct", 0.875) or 0.875))
+if cfg.overlay_pos:
+    try:
+        _px, _py = (int(v) for v in str(cfg.overlay_pos).split(",")[:2])
+        overlay.restore_position(_px, _py)
+    except Exception:
+        pass
+
+
+def _overlay_moved(x: int, y: int, _screen: int):
+    # 位置记忆（§八十二）：拖完立即落盘（强杀也不丢）；单实例下没有并发写者
+    cfg.overlay_pos = f"{x},{y}"
+    try:
+        cfg.save()
+    except Exception:
+        pass
+
+
+overlay.on_position_changed = _overlay_moved
 overlay.set_history(int(getattr(cfg, "history_lines", 1) or 1))
 
 # 显示模式：双语 → 仅译文 → 仅原文 循环（热键 F11 / 菜单）
@@ -276,12 +314,12 @@ def toggle(key: str):
 def menu_builder() -> QMenu:
     """唯一菜单定义：托盘与悬浮窗右键共用。"""
     menu = QMenu()
+    # 穿透开关不进菜单：F10 + 设置-显示页勾选都在（§八十四 菜单精简）
     pairs = [
         ("隐藏字幕" if targets["visible"] else "显示字幕", lambda: toggle("visible")),
         ("暂停" if not targets["paused"] else "继续", lambda: toggle("paused")),
         (f"显示：{MODE_LABEL.get(overlay.display_mode, '双语')}（点击切换）",
          lambda: actions.__setitem__("mode_cycle", True)),
-        ("关闭点击穿透" if targets["through"] else "开启点击穿透", lambda: toggle("through")),
     ]
     for text, fn in pairs:
         act = QAction(text, menu)
@@ -305,11 +343,198 @@ def menu_builder() -> QMenu:
         act = QAction(text, menu)
         act.triggered.connect(lambda _=False, k=key: actions.__setitem__(k, True))
         menu.addAction(act)
+    # 诊断三件套 + 自启（§八十二）：报错一直指向 logs/，却没有任何一步到位的入口；
+    # 实时字幕是要用时必须在跑的常驻工具，开机自启是同类标配（Pot-app 等）。
+    menu.addSeparator()
+    for text, fn in [("快捷键…", _show_hotkeys), ("诊断信息…", _show_diagnostics)]:
+        act = QAction(text, menu)
+        act.triggered.connect(fn)
+        menu.addAction(act)
     menu.addSeparator()
     act_quit = QAction("退出", menu)
     act_quit.triggered.connect(app.quit)
     menu.addAction(act_quit)
     return menu
+
+
+# ---- 托盘菜单的三个对话框/动作（menu_builder 之前定义） ----
+
+def _open_logs():
+    try:
+        os.startfile(str(LOGS_DIR))          # Windows 专属入口（本项目只在 Windows 跑）
+    except Exception as e:
+        tray.notify(f"打开日志目录失败：{e}\n{LOGS_DIR}")
+
+
+_hotkeys_dlg = None
+
+
+def _hotkeys_closed(*_a):
+    global _hotkeys_dlg
+    _hotkeys_dlg = None
+
+
+def _show_hotkeys():
+    """快捷键查看**与改键**（非模态 show——exec() 会冻住 drain/悬浮窗）。
+
+    右侧编辑框点击后按下新键即改：立即生效（先解旧绑再绑新键）并写进
+    cfg.hotkey_map；带修饰键/冲突/失败会提示并回滚。
+    """
+    global _hotkeys_dlg
+    if _hotkeys_dlg is not None:
+        _hotkeys_dlg.show()
+        _hotkeys_dlg.raise_()
+        return
+    from PyQt6.QtGui import QKeySequence
+    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QTableWidget,
+                                 QTableWidgetItem, QAbstractItemView,
+                                 QPushButton, QLabel, QKeySequenceEdit)
+    dlg = QDialog()
+    dlg.setWindowTitle("MaiSubtitle 快捷键（点击右侧框，按下新键即改）")
+    v = QVBoxLayout(dlg)
+    tip = QLabel("点击右侧输入框后直接按下新键（单个按键，不带 Ctrl/Alt/Shift）。"
+                 "改完立即生效并自动保存。")
+    tip.setWordWrap(True)
+    tip.setStyleSheet("color: #888;")
+    v.addWidget(tip)
+    t = QTableWidget(len(HOTKEYS), 2)
+    t.setHorizontalHeaderLabels(["功能", "快捷键（点击改）"])
+    t.verticalHeader().setVisible(False)
+    t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    editors: dict = {}
+
+    def _apply(r: int, action: str, dkey: str, key: str):
+        """校验并应用一次改键；失败回滚输入框。"""
+        if not key:
+            return                          # 清空 = 忽略（不支持无键绑定）
+        if "+" in key:
+            tray.notify("快捷键请用单个按键（不要带 Ctrl/Alt/Shift）")
+        elif key in {k for a, k in _hotkey_map().items() if a != action}:
+            tray.notify("该键已分配给其他功能，请换一个")
+        else:
+            ok, msg = _bind_hotkey(action, key)
+            if ok:
+                if key == dkey:
+                    (cfg.hotkey_map or {}).pop(action, None)
+                else:
+                    cfg.hotkey_map[action] = key
+                try:
+                    cfg.save()
+                except Exception:
+                    pass
+                tray.notify(f"快捷键已改为 {key.upper()}")
+            else:
+                tray.notify(f"改键失败：{msg}")
+        editors[r].blockSignals(True)
+        editors[r].setKeySequence(QKeySequence(_hotkey_map().get(action, dkey).upper()))
+        editors[r].blockSignals(False)
+
+    for r, (dkey, action, desc) in enumerate(HOTKEYS):
+        t.setItem(r, 0, QTableWidgetItem(desc))
+        ed = QKeySequenceEdit(QKeySequence(_hotkey_map().get(action, dkey).upper()))
+        # ⚠ QKeySequenceEdit 没有"占位文本"方法（那是 QLineEdit 的 API）
+        # ——用户点开报 AttributeError 的实锤（§八十四）。提示用 tooltip。
+        ed.setToolTip("点击输入框，然后直接按下新键")
+        ed.setMaximumHeight(26)
+
+        def _changed(seq, _r=r, _a=action, _d=dkey):
+            _apply(_r, _a, _d, (seq.toString() or "").strip().lower())
+
+        ed.keySequenceChanged.connect(_changed)
+        t.setCellWidget(r, 1, ed)
+        editors[r] = ed
+    t.horizontalHeader().setStretchLastSection(True)
+    v.addWidget(t)
+    btn_reset = QPushButton("全部恢复默认")
+    btn_reset.clicked.connect(lambda: _reset_all_hotkeys(editors))
+    v.addWidget(btn_reset)
+    dlg.resize(420, 340)
+    dlg.finished.connect(_hotkeys_closed)
+    _hotkeys_dlg = dlg
+    dlg.show()
+
+
+def _reset_all_hotkeys(editors: dict):
+    """全部恢复默认键（清空 cfg.hotkey_map 并逐个重绑）。"""
+    from PyQt6.QtGui import QKeySequence
+    for _k, action, _d in HOTKEYS:
+        _bind_hotkey(action, _default_key(action))
+    (cfg.hotkey_map or {}).clear()
+    try:
+        cfg.save()
+    except Exception:
+        pass
+    for r, (_k, action, _d) in enumerate(HOTKEYS):
+        ed = editors.get(r)
+        if ed is not None:
+            ed.blockSignals(True)
+            ed.setKeySequence(QKeySequence(_default_key(action).upper()))
+            ed.blockSignals(False)
+    tray.notify("快捷键已全部恢复默认")
+
+
+_diag_dlg = None
+_last_vram = [""]                 # on_state 里捕获的最近一条显存日志
+_ready_notified = [False]         # "一切就绪"只提醒一次
+
+
+def _diagnostics_text() -> str:
+    """只读诊断摘要（§八十二）：把"只写进日志"的数据收进一个窗口。"""
+    import time as _t
+    lines = []
+    try:
+        up = _t.perf_counter() - pipe._t0
+        lines.append(f"运行时长：{int(up // 3600)}h{int(up % 3600 // 60)}m{int(up % 60)}s")
+    except Exception:
+        pass
+    lines.append(f"引擎：翻译 {cfg.engine} · 识别 {cfg.asr_backend}"
+                 f"（{cfg.asr_compute_type}）· VAD {cfg.vad_engine} · 子进程 "
+                 f"{'开' if cfg.gpu_subprocess else '关'}")
+    lines.append(f"统计：识别 {pipe.stats.get('segments', 0)} · 译出 "
+                 f"{pipe.stats.get('translations', 0)} · 错误 {pipe.stats.get('errors', 0)}"
+                 f" · 译不出中文 {pipe.stats.get('zh_fail', 0)} · 近静音丢弃 "
+                 f"{pipe.stats.get('skipped_quiet', 0)} · 缓存命中 "
+                 f"{pipe.stats.get('mt_cache_hit', 0)}")
+    lines.append(f"延迟（原文定稿口径）：{pipe.latency_report()}")
+    lines.append(f"UI 队列积压：{ui_queue.qsize()}")
+    if _last_vram[0]:
+        lines.append(f"显存（每 5 分钟采样）：{_last_vram[0]}")
+    try:
+        tail = (LOGS_DIR / "error.log").read_text(encoding="utf-8",
+                                                  errors="replace").splitlines()[-20:]
+        lines.append("error.log 末 20 行：\n" + ("\n".join(tail) if tail else "（空）"))
+    except OSError:
+        lines.append("error.log：暂无")
+    return "\n".join(lines)
+
+
+def _show_diagnostics():
+    global _diag_dlg
+    if _diag_dlg is not None:
+        _diag_dlg.show()
+        _diag_dlg.raise_()
+        return
+    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QTextEdit, QPushButton,
+                                 QDialogButtonBox)
+    dlg = QDialog()
+    dlg.setWindowTitle("MaiSubtitle 诊断信息（只读）")
+    v = QVBoxLayout(dlg)
+    box = QTextEdit()
+    box.setReadOnly(True)
+    box.setPlainText(_diagnostics_text())
+    v.addWidget(box)
+    row = QDialogButtonBox()
+    btn_logs = QPushButton("打开日志文件夹")
+    btn_logs.clicked.connect(_open_logs)
+    btn_refresh = QPushButton("刷新")
+    btn_refresh.clicked.connect(lambda: box.setPlainText(_diagnostics_text()))
+    row.addButton(btn_logs, QDialogButtonBox.ButtonRole.ActionRole)
+    row.addButton(btn_refresh, QDialogButtonBox.ButtonRole.ActionRole)
+    v.addWidget(row)
+    dlg.resize(640, 460)
+    dlg.finished.connect(lambda: globals().__setitem__("_diag_dlg", None))
+    _diag_dlg = dlg
+    dlg.show()
 
 
 tray = TrayController(left_click=lambda: toggle("visible"),
@@ -343,6 +568,10 @@ def apply_targets():
             else MODE_ORDER[0]
         nxt = MODE_ORDER[(MODE_ORDER.index(cur) + 1) % len(MODE_ORDER)]
         overlay.set_display_mode(nxt)
+        try:
+            pipe.set_display_mode(nxt)   # 管线同步：仅原文不翻译，切回双语立即恢复
+        except Exception:
+            pass
         cfg.display_mode = nxt
         cfg.bilingual = (nxt == "bilingual")
         try:
@@ -363,7 +592,11 @@ def apply_targets():
         out = LOGS_DIR / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.srt"
         n = pipe.export_session(str(out), bilingual=cfg.bilingual)
         print(f"已导出本次会话字幕: {out}（{n} 条）")
-        tray.notify(f"已导出 {n} 条字幕\n{out.name}")
+        _st = pipe.stats
+        tray.notify(f"已导出 {n} 条字幕\n{out.name}\n"
+                    f"本次：识别 {_st.get('segments', 0)} · 译出 "
+                    f"{_st.get('translations', 0)} · 近静音丢弃 "
+                    f"{_st.get('skipped_quiet', 0)}")
     if actions["settings"]:
         actions["settings"] = False
         _open_settings()
@@ -380,18 +613,27 @@ def apply_targets():
         apply_targets()
         # exec() 期间定时器停摆，drain 不会跑 → 这里显式把"已暂停"写上屏（否则看起来像卡死）
         overlay.set_status("已暂停（正在编辑术语库…）")
-        from maisubtitle.glossary_ui import GlossaryEditor
-        dlg = GlossaryEditor(gp, parent=None)
-        dlg.exec()
-        targets["paused"] = was_paused
-        if getattr(dlg, "saved", False):
-            if was_default:
-                cfg.glossary_path = gp      # 首次启用：随退出保存写进 config.json
-            print("术语库编辑完成，已实时生效:", gp)
-            tray.notify(f"术语库已保存：{len(dlg.g.terms)} 条\n{Path(gp).name}"
-                        + ("（重启后生效）" if was_default else "（已实时生效）"))
-        else:
-            print("术语库编辑已关闭（未保存）", gp)
+        try:
+            from maisubtitle.glossary_ui import GlossaryEditor
+            dlg = GlossaryEditor(gp, parent=None)   # 构造即 load：畸形术语文件会抛
+            dlg.exec()
+            if getattr(dlg, "saved", False):
+                if was_default:
+                    cfg.glossary_path = gp      # 首次启用：随退出保存写进 config.json
+                print("术语库编辑完成，已实时生效:", gp)
+                tray.notify(f"术语库已保存：{len(dlg.g.terms)} 条\n{Path(gp).name}"
+                            + ("（重启后生效）" if was_default else "（已实时生效）"))
+            else:
+                print("术语库编辑已关闭（未保存）", gp)
+        finally:
+            # 无论正常关闭还是异常（畸形文件/编辑器内部报错），都必须恢复暂停前的
+            # 状态 —— 否则管线永久停摆、字幕窗一直显示"已暂停"
+            targets["paused"] = was_paused
+            apply_targets()
+            # 状态文字也要恢复：exec 期间 drain 停摆、恢复后没人清
+            # "正在编辑术语库…"残字（用户实拍：退出编辑器后一直显示，§八十四）
+            overlay.set_status("已暂停（F12 或菜单继续）" if targets["paused"]
+                               else "等待语音…")
 
 
 _settings_dlg = None            # 持有引用：show() 非阻塞，不能被 Python GC 掉
@@ -460,6 +702,24 @@ def _after_settings(dlg):
         pipe.set_source_language(getattr(cfg, "source_language", "auto"))
     except Exception:
         pass
+    # 显示模式（管线侧翻译开关）与"每句最少停留"同样是运行期项：
+    # 以前只改了悬浮窗，"仅原文"切回双语永远没有译文、dwell 要重启才生效
+    try:
+        pipe.set_display_mode(getattr(cfg, "display_mode", "bilingual"))
+    except Exception:
+        pass
+    try:
+        pipe.set_stream_translation(cfg.stream_translation)
+    except Exception:
+        pass
+    try:
+        overlay.set_width_pct(float(cfg.width_pct))
+    except Exception:
+        pass
+    try:
+        _disp.set_dwell_ms(float(getattr(cfg, "subtitle_dwell_ms", 900) or 900))
+    except Exception:
+        pass
     print("设置已保存并应用")
     # 改到"重启生效"的项 → 弹窗问是否立即重启（守护进程模式下同样适用）
     rf = list(getattr(dlg, "restart_fields", []) or [])
@@ -492,8 +752,20 @@ def _restart_app():
         print("设置需要重启：交由守护进程重启")
         app.exit(2)
         return
+    # 固定睡 2s 不够：本进程退出前要跑 pipe.stop()（worker 卡在 GPU 调用时最长
+    # join 15s），2s 就拉起新实例会被单实例守卫拒绝 → 新旧两头落空、程序直接消失。
+    # 改成轮询旧 pid 退出（最多 60s，无 psutil 时退回固定等待）再拉起。
     helper = ("import subprocess, sys, time\n"
-              "time.sleep(2.0)\n"
+              f"ppid = {os.getpid()}\n"
+              "time.sleep(1.0)\n"
+              "try:\n"
+              "    import psutil\n"
+              "    for _ in range(120):\n"
+              "        if not psutil.pid_exists(ppid):\n"
+              "            break\n"
+              "        time.sleep(0.5)\n"
+              "except Exception:\n"
+              "    time.sleep(3.0)\n"
               f"subprocess.Popen(sys.argv[1:], cwd={str(PROJECT_ROOT)!r})\n")
     flags = 0x00000008 | 0x00000200      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     subprocess.Popen([sys.executable, "-c", helper, *args],
@@ -507,16 +779,18 @@ def _restart_app():
 #（实测：新装环境"翻译引擎全部不可用 → 只出原文"，界面毫无提示，只能翻 logs/）。
 # 2026-09-18 用户要求去掉弹窗：报错不再打断操作（以前每条 warn/error 弹一个非模态窗，
 # 看视频时得手动关掉）。完整信息仍落 logs/error.log，气泡只显示前两行。
-_alerted: set = set()          # 同一句话只提示一次（子进程重启循环会重复报同一条）
+# 同一句话 10 分钟内只提醒一次（子进程重启循环会重复报同一条）；但**永不清理**的
+# 去重会让反复发生的瞬时故障（如每小时一次的超时）整个会话只报一次 —— 改 TTL 化。
+_alerted: dict = {}
+_ALERT_TTL_S = 600.0
 
 # 给最常见的两种问题配一句"人话 + 怎么办"，其余原样展示
 ALERT_FRIENDLY = (
     ("翻译引擎全部不可用",
      "翻译用不了，这次只显示原文。\n\n"
-     "最常见的原因：本机 torch 是 CPU 版（没吃上显卡）。"
-     "可在 设置 → 翻译引擎 换成 qwen，或按 README 装 CUDA 版 torch；"
-     "也可以在 设置 里指定一个已有的 CUDA torch 目录。"),
-    ("缺模型", "有模型没下载齐。设置窗口底部有「下载缺失的模型」按钮，"
+     "最常见的原因：装到的 torch 是 CPU 版（用不了显卡）。"
+     "两个办法：在 设置 → 翻译引擎 换成 qwen；或按 README 装 CUDA 版 torch。"),
+    ("缺模型", "有模型没下载齐。设置窗口底部有「下载缺失的模型」按钮可以一键补，"
               "或跑 安装_首次使用.bat --check 看缺什么。"),
 )
 
@@ -524,14 +798,19 @@ ALERT_FRIENDLY = (
 def notify_bg(text: str):
     """把一条消息送到右下角通知（**可从任意线程调**）：经 ui_queue 回主线程。
 
-    主线程已死/Qt 不可用时退回直接 tray.notify，再失败就只留日志 —— 无论如何
-    **不再弹系统对话框**（2026-09-18 用户要求：只保留右下角提醒）。
+    队列送不进去（满/主线程已死）就只留日志 —— **绝不**从当前线程直接碰托盘
+    通知（showMessage 是 Qt 调用，跨线程属未定义行为），也**不再弹系统对话框**
+    （2026-09-18 用户要求：只保留右下角提醒）。
     """
     try:
         ui_queue.put_nowait(("__alert__", text, ""))
     except Exception:
+        # 兜底只留日志：本函数契约是"任意线程可调"，而 tray.showMessage 是 Qt
+        # 调用 —— 从非主线程调属于未定义行为（可能随机崩），宁可只有日志
         try:
-            tray.notify(text.splitlines()[0][:200], 8000)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now():%H:%M:%S}] [notify_bg 兜底] "
+                        f"{text.splitlines()[0][:200]}\n")
         except Exception:
             pass
 
@@ -543,9 +822,13 @@ def alert_user(text: str):
     而非模态窗也会挡视线/需手动关闭 —— 用户明确要求只看右下角提醒。
     """
     key = text.strip()[:110]
-    if key in _alerted:
+    now = _time.perf_counter()
+    if key in _alerted and now - _alerted[key] < _ALERT_TTL_S:
         return
-    _alerted.add(key)
+    _alerted[key] = now
+    if len(_alerted) > 200:
+        for k in list(_alerted)[:40]:
+            _alerted.pop(k, None)
     body = text
     for pfx, friendly in ALERT_FRIENDLY:
         if pfx in text:
@@ -564,9 +847,12 @@ def drain():
     # **同一句只应用最后一条**：流式翻译一句会推几十条中间态，
     # 逐条重排会把主线程拖住（进而队列积压、甚至丢消息）。合并后一句只排一次版。
     pending_cues = {}                # cid -> (src, dst, lang, t0)，dict 保序 = 时间顺序
+    saw_alive = False                # 本轮 tick 是否见过任何"活着"的信号
     try:
         while True:
             item = ui_queue.get_nowait()
+            if item[0] != "__status__":
+                saw_alive = True
             if item[0] == "__status__":      # 生命周期状态文本
                 overlay.set_status(item[1])
                 continue
@@ -587,6 +873,7 @@ def drain():
                 # 暂停时仍然要给用户明确反馈，否则看起来就像"卡死了"
                 _disp.reset()            # 暂停期间积压的句子不再补播
                 overlay.set_status("已暂停（F12 或菜单继续）")
+                _pause_ui[0] = True
                 if _time.perf_counter() - _pause_warn["t"] > 5.0:
                     _pause_warn["t"] = _time.perf_counter()
                     print("（暂停中：字幕未显示，F12 继续）", flush=True)
@@ -596,6 +883,31 @@ def drain():
     except queue.Empty:
         pass
     now = _time.perf_counter()
+    # 日志配额以前只在启动时跑一次 —— 长会话中 logs/ 涨满也没人管（§八十二）
+    if now - _quota_t[0] > 6 * 3600.0:
+        _quota_t[0] = now
+        try:
+            pipe.enforce_log_quota(cfg.log_max_mb)
+        except Exception:
+            pass
+    # 静默期心跳角标（§八十二）：>8s 没有任何活动（字幕/识别中/撤回）时提示
+    # "监听中 mm:ss"，回答"它还活着吗"；有内容/暂停/隐藏立即撤。
+    if saw_alive:
+        _last_alive[0] = now
+    if _pause_ui[0] and not targets["paused"]:
+        _pause_ui[0] = False
+        # 从"已暂停"恢复：状态残字必须清掉——以前一直挂到下一句字幕出现，
+        # 静音期看起来像还暂停着（术语库关闭残留同类，§八十四）
+        overlay.set_status("等待语音…")
+    if (targets["paused"] or not targets["visible"]
+            or last_state[0] != "running"
+            or not getattr(cfg, "idle_notice", True)):
+        overlay.set_idle_notice(None)   # 模型加载期/停止/暂停/关掉开关都不显示
+    elif now - _last_alive[0] > 8.0:
+        idle = int(now - _last_alive[0])
+        overlay.set_idle_notice(f"监听中 {idle // 60:02d}:{idle % 60:02d}")
+    else:
+        overlay.set_idle_notice(None)
     for cid, (src, dst, lang, t0) in pending_cues.items():
         tag = LANG_TAG.get(lang, "")
         src_show = f"[{tag}] {src}" if tag else src
@@ -696,6 +1008,9 @@ def _ui_put(item, kind: str):
 _ui_put.last_warn = 0.0
 _lag_warn = {"t": 0.0}          # UI 滞后告警限频
 _pause_warn = {"t": 0.0}        # 暂停提示限频
+_last_alive = [_time.perf_counter()]    # 最近一次"活着"信号（字幕/识别中/撤回/告警）
+_pause_ui = [False]                     # 悬浮窗正处于"已暂停"状态文字（恢复时清残字）
+_quota_t = [_time.perf_counter()]       # 日志配额复跑计时（6h 一次）
 _ui_seen: dict = {}             # cid -> 已应用的最长译文长度（检测译文回退）
 _spin_warn = {"t": 0.0}          # 转圈超时告警限频
 
@@ -824,21 +1139,78 @@ timer.start(60)
 # ---- 全局热键：只改 targets/flags，绝不跨线程碰 Qt ----
 import keyboard  # noqa: E402
 
-for k, fn in [("f9", lambda: toggle("visible")),
-              ("f10", lambda: toggle("through")),
-              ("f11", lambda: actions.__setitem__("mode_cycle", True)),
-              ("f12", lambda: toggle("paused")),
-              ("f5", lambda: actions.__setitem__("lang_cycle", True)),
-              ("f7", lambda: actions.__setitem__("screen_cycle", True)),
-              ("f8", lambda: actions.__setitem__("editor", True)),
-              ("f6", lambda: actions.__setitem__("export", True))]:
-    # 注意：Esc **完全不绑**——游戏/视频/网页里 Esc 用途太多，
-    # 之前绑"退出"会让程序凭空消失，改成"隐藏"用户照样觉得是"关掉了"。
-    # 显隐用 F9，退出用托盘菜单。
+# (键, 说明)：注册处与托盘"快捷键…"对话框**共用这一份**——以前热键只活在 README，
+# 产品内零呈现（8 个全局热键连口口相传都会记混 F8/F9）。
+# (默认键, action, 说明)：注册、托盘-快捷键… 对话框共用这一份；用户改键存
+# cfg.hotkey_map（action -> 键），托盘-快捷键… 可视化改键（立即生效并落盘）。
+HOTKEYS = [
+    ("F5", "lang_cycle", "切换源语言"), ("F6", "export", "导出本次会话 SRT"),
+    ("F7", "screen_cycle", "切换显示器"), ("F8", "editor", "术语库编辑器"),
+    ("F9", "visible", "显示 / 隐藏字幕"), ("F10", "through", "鼠标穿透 开/关"),
+    ("F11", "mode_cycle", "切换显示模式（双语/译文/原文）"),
+    ("F12", "paused", "暂停 / 继续"),
+]
+
+# 注意：Esc **完全不绑**——游戏/视频/网页里 Esc 用途太多，
+# 之前绑"退出"会让程序凭空消失，改成"隐藏"用户照样觉得是"关掉了"。
+# 显隐用 F9，退出用托盘菜单。
+_hk_handles: dict = {}     # action -> keyboard 句柄（重绑时先解旧绑）
+_hk_fns: dict = {}         # action -> 回调
+
+_hk_fns.update({
+    "visible": lambda: toggle("visible"),
+    "through": lambda: toggle("through"),
+    "mode_cycle": lambda: actions.__setitem__("mode_cycle", True),
+    "paused": lambda: toggle("paused"),
+    "lang_cycle": lambda: actions.__setitem__("lang_cycle", True),
+    "screen_cycle": lambda: actions.__setitem__("screen_cycle", True),
+    "editor": lambda: actions.__setitem__("editor", True),
+    "export": lambda: actions.__setitem__("export", True),
+})
+
+
+def _default_key(action: str) -> str:
+    for k, a, _d in HOTKEYS:
+        if a == action:
+            return k.lower()
+    return ""
+
+
+def _hotkey_map() -> dict:
+    """action -> 当前生效的键（默认 + 用户改键覆盖）。"""
+    m = {a: _k.lower() for _k, a, _d in HOTKEYS}
+    for a, k in (cfg.hotkey_map or {}).items():
+        m[str(a)] = str(k).lower()
+    return m
+
+
+def _bind_hotkey(action: str, key: str) -> tuple[bool, str]:
+    """绑定/重绑单个热键（先解旧绑）；失败回滚到默认键。"""
+    fn = _hk_fns.get(action)
+    if fn is None or not key:
+        return False, "未知动作或空键"
+    if action in _hk_handles:
+        try:
+            keyboard.remove_hotkey(_hk_handles[action])
+        except Exception:
+            pass
+        _hk_handles.pop(action, None)
     try:
-        keyboard.add_hotkey(k, fn)
+        _hk_handles[action] = keyboard.add_hotkey(key, fn)
+        return True, ""
     except Exception as e:
-        print(f"热键 {k} 注册失败: {e}")
+        try:
+            _hk_handles[action] = keyboard.add_hotkey(_default_key(action), fn)
+        except Exception:
+            pass
+        return False, f"{type(e).__name__}: {e}"
+
+
+for _k, _action, _d in HOTKEYS:
+    _cur = (cfg.hotkey_map or {}).get(_action) or _k.lower()
+    _ok, _msg = _bind_hotkey(_action, _cur)
+    if not _ok:
+        print(f"热键 {_cur}（{_action}）注册失败: {_msg}")
 
 app.aboutToQuit.connect(pipe.stop)
 app.aboutToQuit.connect(shutdown_report)

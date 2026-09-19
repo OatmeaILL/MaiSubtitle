@@ -2,7 +2,7 @@
   "asr_model": "large-v3-turbo",
   "asr_device": "cuda",
   "beam_size": 5,
-  "asr_compute_type": "float16",
+  "asr_compute_type": "int8_float16",
   "asr_backend": "whisper",
   "asr_http_url": "",
   "asr_http_model": "",
@@ -57,5 +57,8 @@
   "glossary_path": "",
   "gpu_subprocess": true,
   "display_offset_ms": -2,
+  "overlay_pos": "",
+  "width_pct": 0.875,
+  "idle_notice": true,
   "log_max_mb": 100
 }

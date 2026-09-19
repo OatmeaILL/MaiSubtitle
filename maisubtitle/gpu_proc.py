@@ -219,9 +219,18 @@ class GpuWorker:
         return self._n
 
     def _wait_up(self, timeout: float):
-        if self._down.is_set():
-            if not self._down.wait(timeout=max(1.0, min(timeout, 120.0))):
-                raise GpuDead("GPU 子进程正在重启")
+        """_down 置位 = 正在重启：等它清掉再发请求。
+
+        Event 没有"等清零"，只能轮询 —— 以前写成 `self._down.wait(...)`，而进入
+        这里时事件**已置位**、wait() 立即返回 True，整段逻辑从来没生效过。
+        """
+        if not self._down.is_set():
+            return
+        deadline = time.monotonic() + max(1.0, min(timeout, 120.0))
+        while self._down.is_set():
+            if time.monotonic() >= deadline:
+                raise GpuDead("GPU 子进程正在重启（等待重启完成超时）")
+            time.sleep(0.05)
 
     def _send(self, rid: int, method: str, args: dict):
         line = json.dumps({"id": rid, "method": method, "args": args},
@@ -236,7 +245,11 @@ class GpuWorker:
     def call(self, method: str, timeout: float = DEFAULT_TIMEOUT, **args):
         rid = self._next()
         if not self._lock.acquire(timeout=max(1.0, timeout)):
-            raise GpuTimeout(f"{method} 等待 GPU 空闲超时")
+            # _restart 全程持锁（含模型重载，可达几十秒）：等锁超时多半是在等重启，
+            # 报成"GPU 空闲超时"会误导排查方向（HANDOVER §七十六 的教训：报错要真）
+            why = ("等待 GPU 子进程重启完成超时（模型重载中）" if self._down.is_set()
+                   else "等待 GPU 空闲超时")
+            raise GpuTimeout(f"{method} {why}")
         try:
             self._wait_up(timeout)
             if not self.alive:
@@ -252,7 +265,11 @@ class GpuWorker:
         """流式方法（逐块 yield）。结束后收掉最终响应（出错在这里抛）。"""
         rid = self._next()
         if not self._lock.acquire(timeout=max(1.0, timeout)):
-            raise GpuTimeout(f"{method} 等待 GPU 空闲超时")
+            # _restart 全程持锁（含模型重载，可达几十秒）：等锁超时多半是在等重启，
+            # 报成"GPU 空闲超时"会误导排查方向（HANDOVER §七十六 的教训：报错要真）
+            why = ("等待 GPU 子进程重启完成超时（模型重载中）" if self._down.is_set()
+                   else "等待 GPU 空闲超时")
+            raise GpuTimeout(f"{method} {why}")
         try:
             self._wait_up(timeout)
             if not self.alive:
@@ -342,10 +359,15 @@ class RemoteASR:
         self.name = name
 
     def transcribe(self, audio, language=None, prompt=None,
-                   return_confidence=False, beam_size=5, without_timestamps=False):
+                   return_confidence=False, beam_size=5, without_timestamps=False,
+                   no_fallback=False):
+        # without_timestamps 必须透传（wots）：字幕时间轴来自 VAD，模型时间戳纯浪费
+        # 解码步数 —— 以前收下即弃，asr.py 宣称的提速在子进程模式下从未生效（§八十）
         res = self._w.call("transcribe", timeout=DEFAULT_TIMEOUT,
                            audio=_pack(audio), language=language,
-                           prompt=prompt, conf=return_confidence, beam=beam_size)
+                           prompt=prompt, conf=return_confidence, beam=beam_size,
+                           wots=bool(without_timestamps),
+                           nfb=bool(no_fallback))
         return res[0], dict(res[1] or {})
 
     def detect_lang(self, audio):

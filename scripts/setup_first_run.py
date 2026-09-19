@@ -216,7 +216,7 @@ def install_cuda_torch() -> bool:
         say("[错误] CUDA 版 torch 没装上（看上面的报错）；"
             "网络恢复后重跑：安装_首次使用.bat --cuda-torch")
         return False
-    say("[OK] torch 带 CUDA ✓（hymt2 翻译走 GPU）")
+    say("[OK] torch 带 CUDA（hymt2 翻译走 GPU）")
     return True
 
 
@@ -231,7 +231,7 @@ def reqs_without_torch() -> Path:
     out = LOGS_DIR / "requirements-notorch.txt"
     keep = []
     for line in REQ.read_text(encoding="utf-8").splitlines():
-        if line.strip().lower() in ("torch", "torch "):     # 裸 torch 行才去掉
+        if line.strip().lower() in ("torch",):     # 裸 torch 行才去掉
             continue
         keep.append(line)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -385,7 +385,7 @@ def pip_install(args: list, py: Path | None = None, no_deps: bool = False,
         say("      [错误] 这个 .venv 既没有 pip、ensurepip 也补不上；"
             "把 .venv 目录整个删掉再重跑 安装_首次使用.bat")
         return 1
-    return _run_pip(py, args, no_deps)
+    return _run_pip(py, args, no_deps, index_url)
 
 
 def models_state() -> tuple:
@@ -460,7 +460,7 @@ def report(*, fix: bool, skip_deps: bool = False, skip_models: bool = False) -> 
     # ---- 1b. 显卡体检（要不要装 CUDA torch 已在第 1 步决定并执行过）----
     if not missing_imports(["torch"]):
         if torch_has_cuda():
-            say("      torch 带 CUDA ✓（hymt2 翻译走 GPU）")
+            say("      torch 带 CUDA（hymt2 翻译走 GPU）")
         else:
             say("      [注意] torch 不带 CUDA → hymt2 跑 CPU（能用，实测每句 1~2 秒）")
             if not has_nvidia_gpu():

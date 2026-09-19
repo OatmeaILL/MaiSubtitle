@@ -116,10 +116,9 @@ GPU 跑满。
 
 ![综合分排名](docs/bench_rank.svg)
 
-- 最优搭配是 silero + whisper + qwen（综合 83.1）；速度最快的是 silero + qwen3-asr + qwen（体感 3.8s）。
-- 识别模型只占 0.2~0.4s/段，延迟主要在等一句话说完（段长）：silero 段最短所以最快，
-  FireRed 句子更完整但要等 1~2s，FSMN 会切出 10~20s 的超长段，全部垫底。
-- 翻译模型：qwen 约 0.16s/句；hymt2 约 0.6~0.8s/句，打分最高但慢 3~4 倍。
+- 最优搭配 silero + whisper + qwen（综合 83.1）；最快 silero + qwen3-asr + qwen（体感 3.8s）。
+- 延迟的大头是等一句话说完（段长），识别本身只占 0.2~0.4s/段。
+- 翻译：qwen 约 0.16s/句；hymt2 质量打分最高但约 0.6~0.8s/句。
 
 ![延迟构成](docs/bench_latency.svg)
 
@@ -142,8 +141,8 @@ GPU 跑满。
 | 缺模型 | `安装_首次使用.bat --check` 会列出缺什么以及对应命令 |
 | 下载模型失败 | 报错会写 `[fail] 项名（缺 哪个文件）`。脚本按 HF 镜像 → 官方源 → ModelScope 镜像依次试；都不通就按提示把权重手动放进 `models/` 里对应目录 |
 | 卡住或闪退 | 已知问题，守护进程会在心跳超时 25 秒后自动重启 |
-| 译文出得很慢 | 多半是装到的 torch 不带 CUDA（新版 PyPI 的 Windows 轮子就是 CPU 版）→ 设置里把翻译引擎换成 `qwen`（CT2，约 0.22 秒每句，不用 torch）；想用 hymt2 就装 CUDA 版 torch：`pip install torch --index-url https://download.pytorch.org/whl/cu124` |
-| 分句比预期碎 | 缺 FireRedVAD ONNX 时会自动回落 Silero（切得更碎）：`安装_首次使用.bat --skip-models` 重跑一次把导出补上（要 onnx + onnxscript，安装器会自动装） |
+| 译文出得很慢 | torch 多半是 CPU 版（PyPI 的 Windows 轮子默认如此）。设置里把翻译引擎换成 `qwen`（约 0.22 秒每句，不需要 torch）；要用 hymt2 就装 CUDA 版 torch |
+| 分句比预期碎 | 多半缺 FireRedVAD，自动改用了 Silero：重跑 `安装_首次使用.bat --skip-models` 把它补上 |
 
 ## 其它
 

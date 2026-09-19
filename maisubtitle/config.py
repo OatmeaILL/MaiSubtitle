@@ -2,13 +2,14 @@
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# PyInstaller 冻结后资源在 exe 旁边
-if getattr(__import__("sys"), "frozen", False):
-    PROJECT_ROOT = Path(__import__("sys").executable).parent
+# PyInstaller 冻结后资源在 exe 旁边（⚠ sys.frozen 只有冻结环境才有，普通解释器
+# 连属性都不存在 —— 必须 getattr 带默认值，直写 sys.frozen 会 AttributeError）
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).parent
 MODELS_DIR = Path(os.environ.get("MAISUB_MODELS_DIR", PROJECT_ROOT / "models"))
 LOGS_DIR = PROJECT_ROOT / "logs"
 TESTDATA_DIR = PROJECT_ROOT / "testdata"
@@ -224,7 +225,10 @@ class AppConfig:
     asr_model: str = "large-v3-turbo"   # 唯一保留的 whisper 权重（small/medium 已弃用）
     asr_device: str = "cuda"            # cuda / cpu
     beam_size: int = 5                  # 解码束宽（5 提升中文/嘈杂鲁棒性，实测不增延迟）
-    asr_compute_type: str = "float16"        # int8_float16 / float16（float16 实测快约 15%）
+    # int8_float16 / float16 —— 2026-09-19 实测（RTX 4060 Laptop + 现版 CT2）：
+    # int8_float16 快 7~8%、p95 更好（309 vs 347ms），且整段拼接文本与 float16
+    # **逐词一致** → 改为默认（§八十一）。旧记录"float16 快约 15%"在当前环境不成立。
+    asr_compute_type: str = "int8_float16"
     # 识别后端：whisper=本地 faster-whisper（默认）；http=交给本地/远端服务
     # （vLLM 的 vllm serve / Qwen3-ASR 的 qwen-asr-serve / FunASR 服务都提供
     #   /v1/audio/transcriptions 之类的 HTTP 接口，填 asr_http_url 即可对接，
@@ -334,12 +338,25 @@ class AppConfig:
     gpu_subprocess: bool = True
     # 阶段5：蓝牙等音频外设延迟补偿（字幕显示延后毫秒）
     display_offset_ms: int = -2
+    # 悬浮窗位置记忆（§八十二）：拖动释放即写回 "x,y"，启动时钳进可用区域恢复
+    overlay_pos: str = ""
+    # 字幕窗宽度占屏比（§八十三，设置页可调 50~95%）
+    width_pct: float = 0.875
+    # 静默期"监听中 mm:ss"角标开关（§八十二新增的可见性功能，允许关）
+    idle_notice: bool = True
+    # 用户改过的全局热键（§八十四）：action -> 键（如 {"export": "f4"}）；
+    # 默认键与动作清单见 live_demo.HOTKEYS。空 = 全部默认。
+    hotkey_map: dict = field(default_factory=dict)
     # 其他
     log_max_mb: int = 100               # 阶段5：日志限额
 
     def save(self, path: Path = CONFIG_PATH):
-        path.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2),
-                        encoding="utf-8")
+        # 原子写：先写临时文件再 os.replace —— 本项目有看门狗 taskkill 强杀路径，
+        # 写一半被杀会留下截断的 json，下次 load() 静默回默认值、设置（含密钥）全丢
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "AppConfig":

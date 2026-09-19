@@ -367,6 +367,11 @@ class VolcWsAsr:
                     raise VolcAsrError(
                         f"云端识别超时（{self.max_wait:.0f}s 内没收到最后一包，"
                         f"已收 {n_resp} 包，logid={self._logid}）")
+                # 收包前的 socket 超时要收敛到剩余时间：recv 一旦开始就按 timeout
+                # 整额阻塞，否则最坏 max_wait + recv_timeout（20+12=32s）> gpu_proc
+                # 的 30s 看门狗 → 子进程被误判卡死重启（§七十六 同类教训）
+                ws.settimeout(max(0.2, min(self.recv_timeout,
+                                           deadline - time.perf_counter())))
                 try:
                     data = ws.recv()
                 except websocket.WebSocketTimeoutException:

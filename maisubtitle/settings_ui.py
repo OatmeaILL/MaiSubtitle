@@ -21,8 +21,10 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QTabWidget, QWidget, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QGuiApplication
 
 from .asr import WS_BACKENDS, find_qwen_dir
+from .autostart import enabled as autostart_enabled
 from .config import PROJECT_ROOT
 
 # 识别引擎：一个下拉同时表达 backend 与（whisper 唯一的）模型 ——
@@ -43,10 +45,18 @@ ASR_CHOICES = [
 # 这些字段改动后要重启程序才生效（保存后主程序弹窗询问是否立即重启）
 RESTART_FIELDS = {
     "engine": "翻译引擎", "asr_backend": "识别引擎", "asr_model": "识别模型",
+    "asr_compute_type": "识别计算精度",
     "vad_engine": "VAD 引擎", "punct_engine": "补标点引擎",
     # 这三个都在管线启动时读一次（不重启不生效）：以前只登记了 punct_engine，
     # 改「接缝标点/每行补标点/前卷」不提示重启 —— 用户会以为改了没用
     "seam_punct": "接缝标点判定", "punct_final": "定稿补标点", "pre_roll": "前卷",
+    # 分句参数全部在管线启动时读一次（_run 开头快照），不登记就会"改了没效果
+    # 也没提示"—— 与"保存后立即生效"的预期相反
+    "firered_min_silence_ms": "FireRed 句尾静音", "firered_max_speech_s": "FireRed 单句上限",
+    "end_silence_ms": "句尾静音（Silero/FSMN）", "max_sentence_s": "单句最长（Silero/FSMN）",
+    "merge_short_ms": "碎片合并（Silero/FSMN）", "min_speech_ratio": "音乐过滤门",
+    "min_rms": "近静音能量门",
+    "partial_interval_ms": "部分识别节奏", "idle_flush_ms": "断流收尾等待",
     "stream_mode": "流式模式", "beam_size": "识别束宽",
     "context_sentences": "翻译上下文句数", "gpu_subprocess": "GPU 子进程开关",
     "torch_external_dir": "外部 torch 目录",
@@ -137,6 +147,9 @@ def _spawn_console_window(title: str, script: str, args: list,
         ":end",
         "echo.",
         "pause",
+        # 用户按键后自删（标准技巧：goto 使 cmd 放开文件句柄再 del）——
+        # 以前每次下载都在 %TEMP% 残留一个 maisub_*.bat，跨进程越积越多
+        '(goto) 2>nul & del "%~f0"',
     ]
     try:
         bat.write_bytes(("\r\n".join(lines) + "\r\n").encode("gbk", "replace"))
@@ -301,6 +314,16 @@ class SettingsDialog(QDialog):
         self.cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
         form.addRow("识别引擎（重启生效）", self.cmb_backend)
 
+        # 识别计算精度：速度/质量取舍旋钮（2026-09-19 实测见 HANDOVER §八十一）
+        self.cmb_ct = _fill_combo(
+            QComboBox(), ["int8_float16", "float16", "int8"],
+            str(getattr(cfg, "asr_compute_type", "int8_float16") or "int8_float16"),
+            {"int8_float16": "推荐（默认）：权重 8 位存储、混 16 位计算。实测比 float16 "
+                             "快 7~8%、最慢的那几句也更快，识别结果与 float16 一致",
+             "float16": "半精度。如果觉得识别在嘈杂环境变差，换回这个试试",
+             "int8": "纯 8 位。速度和 int8_float16 差不多，一般用不到"})
+        form.addRow("识别计算精度（重启生效）", self.cmb_ct)
+
         # Qwen3-ASR 的模型目录：自动侦测（放在 models/ 下即可，不再手填路径）
         self.lb_qwen_state = QLabel("")
         self.lb_qwen_state.setWordWrap(True)
@@ -380,7 +403,10 @@ class SettingsDialog(QDialog):
         self._ws_timer.setInterval(200)
         self._ws_timer.timeout.connect(self._ws_poll)
         for _w in (self.ed_ws_key, self.ed_ws_app, self.ed_ws_acc):
-            _w.textChanged.connect(self._sync_backend)   # 密钥一填就更新状态提示
+            # editingFinished（焦点离开/回车）而不是 textChanged：以前每敲一个字符
+            # 就对 15+ 个 widget 重跑一遍显隐 + 重写提示样式，纯浪费；"填了没"的
+            # 状态在离开输入框时刷新语义不变
+            _w.editingFinished.connect(self._sync_backend)
 
         self.cmb_engine = QComboBox()
         _fill_combo(self.cmb_engine, [o for o, _ in ENGINES], cfg.engine, dict(ENGINES))
@@ -444,14 +470,49 @@ class SettingsDialog(QDialog):
         form.addRow(_desc("决定「一句」有多长：体感延迟 ≈ 段长 + 0.7s，段长是最大的旋钮；"
                           "拿不准就点上面的「低延迟预设」。"))
 
-        btn_lowlat = QPushButton("低延迟预设（实时渐进 + 4.5s 单句上限 + 500ms 断句）")
+        btn_lowlat = QPushButton("低延迟预设（实时渐进 + 4s 单句上限 + 500ms 断句）")
         btn_lowlat.setToolTip(
             "把影响延迟的几项一次调好：\n"
             "  流式模式 = realtime、渐进显示 = 开\n"
-            "  FireRed 单句上限 = 4.5s、断句静音 = 500ms\n"
+            "  FireRed 单句上限 = 4s、断句静音 = 500ms\n"
             "体感延迟 ≈ 段长 + 0.7s；关掉渐进显示/放宽单句上限会让延迟成倍上升。")
         btn_lowlat.clicked.connect(self._preset_low_latency)
-        form.addRow("", btn_lowlat)
+        btn_balanced = QPushButton("均衡（推荐默认）")
+        btn_balanced.setToolTip(
+            "恢复出厂推荐：实时渐进 + FireRed 单句上限 7s + 断句静音 500ms + 每句停留 2000ms\n"
+            "（= README 默认值表）")
+        btn_balanced.clicked.connect(self._preset_balanced)
+        btn_quality = QPushButton("高质量（完整句优先）")
+        btn_quality.setToolTip(
+            "句子更完整、翻译上下文更好，但延迟明显上升：\n"
+            "  FireRed 单句上限 = 10s、渐进显示 = 关（整句出）")
+        btn_quality.clicked.connect(self._preset_quality)
+        _row3 = QHBoxLayout()
+        _row3.addWidget(btn_lowlat)
+        _row3.addWidget(btn_balanced)
+        _row3.addWidget(btn_quality)
+        form.addRow("", _wrap(_row3))
+
+        self.sp_partial = QSpinBox()
+        self.sp_partial.setRange(300, 3000)
+        self.sp_partial.setSingleStep(100)
+        self.sp_partial.setSuffix(" ms")
+        self.sp_partial.setValue(int(getattr(cfg, "partial_interval_ms", 800)))
+        self.sp_partial.setToolTip(
+            "部分识别节奏：说话期间每这么久把已说的内容识别上屏一次。\n"
+            "调小=字幕长得快但 GPU 占用高（超过 3s 的长句会自动 ×2 降频）；\n"
+            "调大=省 GPU 但字幕生长慢。重启生效")
+        self.lb_partial, _ = _row(form, "部分识别节奏", self.sp_partial)
+
+        self.sp_idle = QSpinBox()
+        self.sp_idle.setRange(1000, 6000)
+        self.sp_idle.setSingleStep(250)
+        self.sp_idle.setSuffix(" ms")
+        self.sp_idle.setValue(int(float(getattr(cfg, "idle_flush_ms", 2500.0))))
+        self.sp_idle.setToolTip(
+            "音频断流（视频暂停/过场）多久后把最后一句收尾上屏。\n"
+            "实测 900ms 会频繁误切出半句，默认 2500 —— 改小前想清楚。重启生效")
+        self.lb_idle, _ = _row(form, "断流收尾等待", self.sp_idle)
 
         self.cmb_vad = QComboBox()
         _fill_combo(self.cmb_vad, [o for o, _ in VADS], cfg.vad_engine, dict(VADS))
@@ -470,8 +531,8 @@ class SettingsDialog(QDialog):
         self.sp_fr_max.setRange(4, 20)
         self.sp_fr_max.setSuffix(" s")
         self.sp_fr_max.setValue(int(float(getattr(cfg, "firered_max_speech_s", 7.0))))
-        self.sp_fr_max.setToolTip("FireRedVAD 单句上限：连续说话没停顿时强制切。\n"
-                                 "实测 20s → 韩语解说一行 18.7s（等太久）；7s → 7.0s")
+        self.sp_fr_max.setToolTip("FireRedVAD 单句上限：连续说话没有停顿时强制切。\n"
+                                 "实测设 20s 时韩语解说出过一行等 18.7s 的字；设 7s 最长等 7.0s")
         self.lb_fr_max, _ = _row(form, "  └ FireRed 单句上限", self.sp_fr_max)
 
         self.sp_end_sil = QSpinBox()
@@ -504,10 +565,9 @@ class SettingsDialog(QDialog):
         self.sp_ratio.setSuffix(" %")
         self.sp_ratio.setValue(int(float(getattr(cfg, "min_speech_ratio", 0.35)) * 100))
         self.sp_ratio.setToolTip(
-            "音乐过滤强度：VAD 判为有声的帧占比低于此值 → 这段按「多半是音乐/伴奏」\n"
-            "处理（2026-09-16 起不再整段丢弃，而是照常识别、再用\n"
-            "无语音置信度/对数概率淘汰，避免听歌或游戏 BGM 下漏句）。\n"
-            "调高＝更激进地过滤音乐段；设 0＝完全不过滤。")
+            "音乐过滤强度：低于这个占比的段先当作可能是音乐/伴奏——仍会正常识别，\n"
+            "识别后再按置信度筛掉确实是音乐的部分，所以听歌/游戏 BGM 不容易漏句。\n"
+            "调高＝过滤更严；设 0＝不过滤。听歌时漏字就调低，字幕出垃圾就调高。")
         form.addRow("音乐过滤强度", self.sp_ratio)
 
         self.sp_rms = QSpinBox()
@@ -594,7 +654,7 @@ class SettingsDialog(QDialog):
         form.addRow("每句最少停留", self.sp_dwell)
 
         self.sp_hist = QSpinBox()
-        self.sp_hist.setRange(0, 3)
+        self.sp_hist.setRange(0, 5)      # 3→5（overlay 已支持，§八十二）
         self.sp_hist.setValue(int(getattr(cfg, "history_lines", 1)))
         self.sp_hist.setToolTip("悬浮窗保留的历史句行数（上一句还在翻译时也留在屏幕上）")
         form.addRow("历史行数", self.sp_hist)
@@ -633,6 +693,35 @@ class SettingsDialog(QDialog):
         self.chk_through = QCheckBox("鼠标点击穿透")
         self.chk_through.setChecked(cfg.click_through)
         form.addRow("", self.chk_through)
+
+        self.chk_stream_tr = QCheckBox("流式翻译：译文逐字长出（关=整句一次出现）")
+        self.chk_stream_tr.setChecked(bool(getattr(cfg, "stream_translation", True)))
+        self.chk_stream_tr.setToolTip(
+            "译文没正常出现时可以关掉它试试；改完立即生效")
+        form.addRow("", self.chk_stream_tr)
+
+        self.sp_width = QSpinBox()
+        self.sp_width.setRange(50, 95)
+        self.sp_width.setSuffix(" %")
+        self.sp_width.setValue(int(float(getattr(cfg, "width_pct", 0.875)) * 100))
+        self.sp_width.setToolTip("字幕窗宽度占屏比：越大单行能放的字越多。立即生效")
+        form.addRow("字幕宽度", self.sp_width)
+
+        self.chk_idle = QCheckBox("静默期显示『监听中 mm:ss』角标（证明程序活着）")
+        self.chk_idle.setChecked(bool(getattr(cfg, "idle_notice", True)))
+        form.addRow("", self.chk_idle)
+
+        btn_resetpos = QPushButton("恢复默认位置")
+        btn_resetpos.setToolTip("清除记住的位置，回到屏幕底部默认摆放（不压任务栏）")
+        btn_resetpos.clicked.connect(self._reset_overlay_pos)
+        form.addRow("", btn_resetpos)
+
+        self.sp_split = QSpinBox()
+        self.sp_split.setRange(0, 200)
+        self.sp_split.setValue(int(getattr(cfg, "split_long_chars", 60) or 0))
+        self.sp_split.setToolTip(
+            "超过这么长的句按句末标点切成多行（时间按比例分摊；0=不切）。立即生效")
+        form.addRow("单行字数上限", self.sp_split)
         return page
 
     # ---------------- 页签 4：术语与质量 ----------------
@@ -677,6 +766,14 @@ class SettingsDialog(QDialog):
         _row_torch.addWidget(self.ed_torch_dir)
         _row_torch.addWidget(_btn_torch)
         form.addRow("外部 torch 目录（重启生效）", _wrap(_row_torch))
+
+        form.addRow(_desc("—— 系统 ——"))
+        self.chk_autostart = QCheckBox("开机自动启动 MaiSubtitle")
+        self.chk_autostart.setChecked(autostart_enabled())
+        self.chk_autostart.setToolTip("写入当前用户的注册表 Run 键；勾选即生效（不用保存）。"
+                                      "单实例守卫保证与手动启动不冲突")
+        self.chk_autostart.toggled.connect(self._on_autostart_toggle)
+        form.addRow("", self.chk_autostart)
         return page
 
     def _browse_glossary(self):
@@ -826,6 +923,36 @@ class SettingsDialog(QDialog):
         self.lbl_hint.setText("已套用低延迟预设：实时渐进显示 + FireRed 单句上限 4s + "
                               "断句静音 500ms + 每句停留 900ms（保存后重启生效）")
 
+    def _preset_balanced(self):
+        """推荐默认 = 出厂默认值表（README 同一份口径）。"""
+        def _set(sp, v):
+            sp.setValue(int(max(sp.minimum(), min(v, sp.maximum()))))
+
+        self.cmb_stream.setCurrentText("realtime")
+        self.chk_progressive.setChecked(True)
+        _set(self.sp_fr_max, 7)
+        _set(self.sp_fr_sil, 500)
+        _set(self.sp_end_sil, 400)
+        _set(self.sp_merge, 1200)
+        self.sp_dwell.setValue(2000)
+        self.lbl_hint.setText("已套用均衡预设：实时渐进 + FireRed 单句上限 7s + "
+                              "断句静音 500ms + 每句停留 2000ms（保存后重启生效）")
+
+    def _preset_quality(self):
+        """完整句优先：延迟换完整性（解说/课程类内容合适）。"""
+        def _set(sp, v):
+            sp.setValue(int(max(sp.minimum(), min(v, sp.maximum()))))
+
+        self.cmb_stream.setCurrentText("realtime")
+        self.chk_progressive.setChecked(False)
+        _set(self.sp_fr_max, 10)
+        _set(self.sp_fr_sil, 600)
+        _set(self.sp_end_sil, 500)
+        _set(self.sp_merge, 1200)
+        self.sp_dwell.setValue(2000)
+        self.lbl_hint.setText("已套用高质量预设：FireRed 单句上限 10s + 渐进显示关 "
+                              "（整句出）—— 延迟会明显上升（保存后重启生效）")
+
     def _model_kw(self) -> dict:
         """界面上"当前选着"的引擎/后端/VAD（还没保存也算）——状态行与下载都按它算。"""
         return dict(engine=self.cmb_engine.currentText(),
@@ -853,6 +980,7 @@ class SettingsDialog(QDialog):
                                "下完后关掉那个窗口，这里会自动刷新；重启程序即生效。")
             self.lb_dl.setStyleSheet("color: #d08a2a;")
             if not self._dl_timer.isActive():
+                self._dl_active = True       # 不置位的话 _dl_poll 每秒空转、永远等不到收尾
                 self._dl_timer.start()       # 关掉再打开的窗口也能盯到结束
             return
         self.btn_dl.setEnabled(True)
@@ -949,11 +1077,30 @@ class SettingsDialog(QDialog):
                   self.lb_max_sent, self.sp_max_sent):
             w.setEnabled(not fr)
 
+    def _on_autostart_toggle(self, on: bool):
+        from maisubtitle.autostart import set_autostart
+        ok, msg = set_autostart(on)
+        if not ok:
+            self.chk_autostart.blockSignals(True)
+            self.chk_autostart.setChecked(not on)
+            self.chk_autostart.blockSignals(False)
+            QMessageBox.warning(self, "开机自启设置失败", msg)
+
+    def _reset_overlay_pos(self):
+        self.cfg.overlay_pos = ""
+        self.overlay.restore_default_position()
+        QMessageBox.information(self, "已恢复", "字幕已回到默认位置（底部居左、不压任务栏）。")
+
     # ---------------- 保存 ----------------
     def _save(self):
         cfg, overlay = self.cfg, self.overlay
-        # 需要重启才生效的字段：记下改前的值，保存后由主程序弹窗询问是否立即重启
-        restart_before = {k: getattr(cfg, k, None) for k in RESTART_FIELDS}
+        # 需要重启才生效的字段：对比基准用**磁盘配置**而不是内存 cfg ——
+        # CLI 透传启动时（如 --engine qwen，磁盘是 qwen3），用户没动下拉、保存时
+        # _resolve 写回磁盘原值；拿内存覆盖值当基准就会凭空 diff 出"改了引擎"，
+        # 误弹"需要重启才生效"（什么都没改也弹）。
+        from .config import AppConfig
+        disk_cfg = AppConfig.load()
+        restart_before = {k: getattr(disk_cfg, k, None) for k in RESTART_FIELDS}
 
         def _resolve(field: str, new_value: str) -> str:
             """CLI 透传字段：用户没改选择 → 写磁盘原值；改了 → 写用户的新值。"""
@@ -963,6 +1110,7 @@ class SettingsDialog(QDialog):
             return new_value
 
         cfg.asr_backend = self.cmb_backend.currentData() or self.cmb_backend.currentText()
+        cfg.asr_compute_type = self.cmb_ct.currentText()
         cfg.asr_model = "large-v3-turbo"      # 唯一保留的 whisper 权重（界面不再可选）
         cfg.asr_http_url = self.ed_http.text().strip()
         cfg.asr_http_model = self.ed_http_model.text().strip()
@@ -993,6 +1141,12 @@ class SettingsDialog(QDialog):
         cfg.pre_roll = self.chk_preroll.isChecked()
         cfg.min_speech_ratio = self.sp_ratio.value() / 100.0
         cfg.progressive_display = self.chk_progressive.isChecked()
+        cfg.stream_translation = self.chk_stream_tr.isChecked()
+        cfg.width_pct = self.sp_width.value() / 100.0
+        cfg.idle_notice = self.chk_idle.isChecked()
+        cfg.split_long_chars = self.sp_split.value()
+        cfg.partial_interval_ms = float(self.sp_partial.value())
+        cfg.idle_flush_ms = float(self.sp_idle.value())
         cfg.context_sentences = self.sp_ctx.value()
         cfg.beam_size = self.sp_beam.value()
         cfg.font_size_src = self.sp_src_font.value()
@@ -1016,7 +1170,7 @@ class SettingsDialog(QDialog):
         overlay.set_display_mode(cfg.display_mode)
         overlay.set_history(cfg.history_lines)
         overlay.set_click_through(cfg.click_through)
-        screens = __import__("PyQt6.QtGui", fromlist=["QGuiApplication"]).QGuiApplication.screens()
+        screens = QGuiApplication.screens()
         scr = screens[min(cfg.screen, len(screens) - 1)]
         geo = scr.geometry()
         overlay.move(geo.x() + (geo.width() - overlay.width()) // 2,

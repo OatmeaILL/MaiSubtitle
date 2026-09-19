@@ -70,6 +70,9 @@ def _mel_filterbank(sr: int, n_fft: int, n_mels: int, fmin: float, fmax: float) 
     return (fb * enorm[:, None]).astype(np.float32)
 
 
+_FB_CACHE: dict = {}    # (sr, n_fft, n_mels) -> mel 滤波器组（热路径：每句一次）
+
+
 def log_mel(audio_f32: np.ndarray, sample_rate: int = 16000,
             n_mels: int = 128, n_fft: int = 400, hop: int = 160) -> np.ndarray:
     """Whisper 参数 log-mel：[n_mels, T]（**丢掉最后一帧**，与官方一致）。"""
@@ -79,7 +82,10 @@ def log_mel(audio_f32: np.ndarray, sample_rate: int = 16000,
     n_frames = 1 + (len(audio) - n_fft) // hop
     idx = np.arange(n_fft)[None, :] + hop * np.arange(n_frames)[:, None]
     spec = np.abs(np.fft.rfft(audio[idx] * win, axis=1)) ** 2      # [T, 201]
-    fb = _mel_filterbank(sample_rate, n_fft, n_mels, 0.0, 8000.0)
+    key = (sample_rate, n_fft, n_mels)
+    fb = _FB_CACHE.get(key)
+    if fb is None:                    # 常量矩阵，缓存住（以前每句字幕都重算一遍）
+        fb = _FB_CACHE[key] = _mel_filterbank(sample_rate, n_fft, n_mels, 0.0, 8000.0)
     mel = spec @ fb.T
     log_spec = np.log10(np.maximum(mel, 1e-10))
     log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
@@ -163,13 +169,15 @@ class Qwen3AsrOnnx:
     def _embed_rows(self, ids_row: np.ndarray) -> np.ndarray:
         return self._embed_fp16[np.asarray(ids_row, dtype=np.int64)].astype(np.float32)
 
-    def _prompt_ids(self, n_audio: int, language: str | None) -> tuple[np.ndarray, int]:
+    def _prompt_ids(self, n_audio: int, language: str | None,
+                    ctx: str | None = None) -> tuple[np.ndarray, int]:
         """官方结构：
         <|im_start|>system\\n<|im_end|>\\n<|im_start|>user\\n<audio>…<|im_end|>\\n
         <|im_start|>assistant\\n[language X]<asr_text>"""
         ids = [self.im_start_id]
-        if self.context:
-            ids += self.tok.encode("system\n" + self.context, add_special_tokens=False).ids
+        context = self.context if ctx is None else ctx
+        if context:
+            ids += self.tok.encode("system\n" + context, add_special_tokens=False).ids
         else:
             ids += self._system_ids
         ids += [self.im_end_id, self.NEWLINE_TOKEN_ID, self.im_start_id]
@@ -194,8 +202,10 @@ class Qwen3AsrOnnx:
             self._embed_fp16 = self._load_embed()
         wav = (audio.astype(np.float32) / 32768.0 if audio.dtype == np.int16
                else np.asarray(audio, dtype=np.float32))
-        if prompt:                                   # 术语/词汇偏置进 system 轮
-            self.context = (self.context + "\n" + prompt).strip()
+        # 术语/词汇偏置只作用于**本次调用**：以前把 prompt 无限累加进 self.context，
+        # 配了术语表后第 N 句的 system 轮里就有 N 份重复术语 —— prefill 逐句变长
+        #（延迟单调上涨）、重复偏置还加剧提示词回声。
+        ctx = (self.context + "\n" + prompt).strip() if prompt else self.context
 
         mel = log_mel(wav, sample_rate=self.spec["sample_rate"],
                       n_fft=self.spec["n_fft"], hop=self.spec["hop_length"],
@@ -207,7 +217,7 @@ class Qwen3AsrOnnx:
         n_audio = int(feats.shape[1])
         expect = feat_extract_output_lengths(mel.shape[1])    # 对账用（不一致=特征管线有问题）
 
-        ids, audio_offset = self._prompt_ids(n_audio, language)
+        ids, audio_offset = self._prompt_ids(n_audio, language, ctx)
         pos = np.arange(ids.shape[1], dtype=np.int64)[None, :]
         t1 = time.perf_counter()
         logits, pk, pv = self.dec_init.run(None, {

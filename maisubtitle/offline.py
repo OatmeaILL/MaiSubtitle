@@ -13,6 +13,8 @@ from .subtitles import Cue, write_srt, write_ass
 from .translate import (NullMT, force_zh,
                         make_translator, substitute_terms, terms_in,
                         to_simplified)
+from .live import (_looks_like_hallucination, _looks_like_loop,  # noqa: E402
+                   _looks_like_prompt_echo, _script_lang)
 from .vad import SileroVAD, segment_audio
 
 TRANSLATABLE = {"en", "ja", "ko"}
@@ -38,24 +40,38 @@ def translate_file(input_path: str | Path,
                    bilingual: bool = True,
                    formats: tuple = ("srt", "ass"),
                    offset: float = 0.0,
-                   progress=None) -> list[Cue]:
+                   progress=None, warnings: list | None = None) -> list[Cue]:
     """主入口：返回 cues 并写出字幕文件。
 
-    progress: 可选回调 fn(stage: str, i: int, n: int)。
+    progress: 可选回调 fn(stage, i, n, done_s=0, total_s=0, elapsed_s=0)。
+    warnings: 可选列表 —— 静默降级（翻译不可用/设备回退）时写进这里，调用方负责展示。
     """
     t_start = time.perf_counter()
     input_path = Path(input_path)
     out_prefix = Path(out_prefix or input_path.with_suffix(""))
     progress = progress or (lambda *a: None)
 
+    def _warn(msg: str):
+        if warnings is not None:
+            warnings.append(msg)
+        print(f"[注意] {msg}", flush=True)
+
     pcm, duration = audio.decode_media(input_path)
-    progress("decode", 0, 1)
+    progress("decode", 0, 1, 0.0, duration, time.perf_counter() - t_start)
 
     vad = SileroVAD(threshold=0.6)
     segments = segment_audio(pcm, vad, end_silence_ms=400)  # 离线宽容些
-    progress("vad", len(segments), len(segments))
+    progress("vad", len(segments), len(segments), 0.0, duration,
+             time.perf_counter() - t_start)
 
-    asr = asr_mod.WhisperASR(asr_model, device="cuda", compute_type="int8_float16")
+    try:
+        asr = asr_mod.WhisperASR(asr_model, device="cuda",
+                                 compute_type="int8_float16")
+    except Exception as e:
+        # 无 GPU/驱动异常的机器以前直接崩（实时模式有 gpu_proc 自愈，离线裸奔）
+        _warn(f"GPU 初始化失败（{type(e).__name__}），识别改走设备 auto（可能落 CPU，较慢）")
+        asr = asr_mod.WhisperASR(asr_model, device="auto",
+                                 compute_type="int8_float16")
 
     gp = resolve_glossary_path(glossary_path)
     glossary = Glossary(gp) if gp else None
@@ -63,6 +79,7 @@ def translate_file(input_path: str | Path,
         mt = make_translator(engine)          # 构造即加载（load_s 已在 __init__ 里记）
     except Exception:
         mt = NullMT()                         # 全部不可用：只出原文（NLLB 已移除）
+        _warn("翻译引擎全部不可用，本次只输出原文（不写译文列）")
 
     cues: list[Cue] = []
     lang_lock: str | None = None if src == "auto" else src
@@ -70,20 +87,26 @@ def translate_file(input_path: str | Path,
 
     import re as _re
     n = len(segments)
+    total_s = float(duration or 0.0)
+    done_s = 0.0
     for i, seg in enumerate(segments):
         piece = pcm[seg["start"]:seg["end"]]
         dur = len(piece) / 16000
+        done_s += dur
+        progress("asr", i + 1, n, done_s, total_s, time.perf_counter() - t_start)
         if dur < 0.6:
             continue
-        # 语言决策（同实时策略）
+        # 语言决策（同实时策略）：锁定后**每 20 段才复检一次** —— 以前 src=auto
+        # 时每段都跑一遍 detect_lang（白烧一次编码器前向）。
         lang = lang_lock
-        if lang is None or src == "auto":
+        if lang is None or (src == "auto" and i % 20 == 19):
             det, prob = asr.detect_lang(piece)
             if det in TRANSLATABLE | {"zh"} and dur >= 1.0 and prob >= 0.6:
-                lang_lock = det
-                lang = det
-                if lang != det:
+                # 先比较后赋值 —— 旧代码 `lang_lock = det` 之后才比较，恒为假，
+                # 换语种时上一语种的译文留在上下文里污染后续翻译（§七十九 记账未修）
+                if lang_lock != det:
                     context.clear()
+                lang_lock = det
             lang = lang_lock
         if lang is None:
             continue
@@ -94,11 +117,23 @@ def translate_file(input_path: str | Path,
         text = text.strip()
         # 语种纠偏（同实时管线）：锁语言/检测错位时，中文文本会被按外语送去翻译，
         # 翻译模型收到"中文→中文"就原样回声。按文字系统直接纠正。
-        from .live import _script_lang
         script = _script_lang(text)
         if script and script != lang:
             lang = script
         if len(text) < 2:
+            continue
+        # 识别质量门（与实时管线同一组函数，§八十二）：片头/片尾/BGM 恰是幻觉与
+        # 音乐污染的重灾区 —— 不过门会把"ご視聴ありがとうございました"这类
+        # 套话直接写进 SRT。阈值沿用实时管线现值。
+        _meta_d = _meta or {}
+        nsp = float(_meta_d.get("no_speech_prob") or 0.0)
+        alp = float(_meta_d.get("avg_logprob") or 0.0)
+        music_risk = float(seg.get("max_prob", 1.0) or 1.0) < 0.5
+        if (nsp > 0.70
+                or (music_risk and (nsp > 0.45 or alp < -2.0))
+                or _looks_like_hallucination(text)
+                or _looks_like_loop(text)
+                or (prompt and _looks_like_prompt_echo(text, prompt))):
             continue
 
         dst = ""

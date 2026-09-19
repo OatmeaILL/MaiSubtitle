@@ -170,7 +170,9 @@ def main(argv=None):
                 text, meta = ensure_asr().transcribe(
                     _unpack(a["audio"]), language=a.get("language"),
                     prompt=a.get("prompt"), return_confidence=bool(a.get("conf")),
-                    beam_size=int(a.get("beam") or 5))
+                    beam_size=int(a.get("beam") or 5),
+                    without_timestamps=bool(a.get("wots")),
+                    no_fallback=bool(a.get("nfb")))
                 send({"id": rid, "ok": True, "result": [text, meta]})
             elif method == "detect":
                 lang, prob = ensure_asr().detect_lang(_unpack(a["audio"]))

@@ -17,6 +17,7 @@ MaiSubtitle.exe
 _internal/
 .workbuddy/
 .zcode/
+.zcodeignore
 .idea/
 .vscode/
 *.pyc
@@ -27,6 +28,10 @@ glossary.csv
 
 # 本地配置（会存 API Key 等私密信息）：仓库里给的是 config.example.json 模板
 config.json
+
+# 原子写（config.save / Glossary.save，2026-09-19）的临时文件：写一半被杀会残留，
+# config.json.tmp 同样含密钥 —— 绝不能进 git
+*.tmp
 
 # Windows 快捷方式（本机自己建的，不是仓库内容）
 *.lnk

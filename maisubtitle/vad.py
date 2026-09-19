@@ -83,8 +83,9 @@ def segment_audio(audio: np.ndarray, vad: SileroVAD,
 
     def emit(end_s, silence_frames, pad_e):
         pad_s = int(pad_start_ms / 1000 * SAMPLE_RATE)
+        pad_e_n = int(pad_e / 1000 * SAMPLE_RATE)   # pad_e 是**毫秒**，要换算成样本
         s = max(0, int(run_start) - pad_s)
-        e = min(len(audio), int(end_s) - int(silence_frames) * FRAME_SIZE + int(pad_e))
+        e = min(len(audio), int(end_s) - int(silence_frames) * FRAME_SIZE + pad_e_n)
         return {"start": s, "end": e, "max_prob": round(max_prob, 3)}
 
     for pos, prob in vad.frames_probs(audio):
