@@ -123,6 +123,14 @@ GPU 跑满。
 
 ![延迟构成](docs/bench_latency.svg)
 
+不看延迟、单看质量的三个维度（识别质量只由分句+识别引擎决定，同组三种翻译引擎分数相同）：
+
+![识别质量](docs/bench_asr.svg)
+
+![翻译质量](docs/bench_mt.svg)
+
+![质量综合（识别 + 翻译，不含延迟）](docs/bench_quality.svg)
+
 在自己的机器上跑一遍再对照（本机结果在 `docs/bench_dev.json`）：
 
 ```
